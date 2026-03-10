@@ -19,8 +19,13 @@ set(DRIVER_SOURCES
 )
 
 set(CORE_SOURCES
+    core/bicep.c
+    core/calibration.c
     core/gestures.c
     core/inference.c
+    core/inference_ensemble.c
+    core/inference_mlp.cc
+    core/emg_model_data.cc
 )
 
 set(APP_SOURCES
@@ -36,5 +41,5 @@ idf_component_register(
         ${APP_SOURCES}
     INCLUDE_DIRS
         .
-    REQUIRES esp_adc
+    REQUIRES esp_adc nvs_flash esp-dsp esp-tflite-micro
 )

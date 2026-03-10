@@ -10,6 +10,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
+
 /*******************************************************************************
  * Private Data
  ******************************************************************************/
@@ -51,6 +52,19 @@ void gestures_execute(gesture_t gesture)
     }
 }
 
+gesture_t parse_gesture(const char *s)
+{
+    if (strcmp(s, "rest") == 0)       return GESTURE_REST;
+    if (strcmp(s, "fist") == 0)       return GESTURE_FIST;
+    if (strcmp(s, "open") == 0)       return GESTURE_OPEN;
+    if (strcmp(s, "hook-em") == 0 ||
+        strcmp(s, "hookem") == 0)     return GESTURE_HOOK_EM;
+    if (strcmp(s, "thumbs-up") == 0 ||
+        strcmp(s, "thumbsup") == 0)   return GESTURE_THUMBS_UP;
+
+    return GESTURE_NONE;
+}
+
 const char* gestures_get_name(gesture_t gesture)
 {
     if (gesture >= GESTURE_COUNT) {
@@ -65,38 +79,49 @@ const char* gestures_get_name(gesture_t gesture)
 
 void gesture_open(void)
 {
-    hand_unflex_all();
+    hand_set_finger_angle(FINGER_THUMB, minAngles[FINGER_THUMB]);
+    hand_set_finger_angle(FINGER_INDEX, minAngles[FINGER_INDEX]);
+    hand_set_finger_angle(FINGER_MIDDLE, minAngles[FINGER_MIDDLE]);
+    hand_set_finger_angle(FINGER_RING, minAngles[FINGER_RING]);
+    hand_set_finger_angle(FINGER_PINKY, minAngles[FINGER_PINKY]);
 }
 
 void gesture_fist(void)
 {
-    hand_flex_all();
+    hand_set_finger_angle(FINGER_INDEX, maxAngles[FINGER_INDEX]);
+    hand_set_finger_angle(FINGER_MIDDLE, maxAngles[FINGER_MIDDLE]);
+    hand_set_finger_angle(FINGER_RING, maxAngles[FINGER_RING]);
+    hand_set_finger_angle(FINGER_PINKY, maxAngles[FINGER_PINKY]);
+    hand_set_finger_angle(FINGER_THUMB, maxAngles[FINGER_THUMB]);
 }
 
 void gesture_hook_em(void)
 {
     /* Index and pinky extended, others flexed */
-    hand_flex_finger(FINGER_THUMB);
-    hand_unflex_finger(FINGER_INDEX);
-    hand_flex_finger(FINGER_MIDDLE);
-    hand_flex_finger(FINGER_RING);
-    hand_unflex_finger(FINGER_PINKY);
+    hand_set_finger_angle(FINGER_THUMB, maxAngles[FINGER_THUMB]);
+    hand_set_finger_angle(FINGER_INDEX, minAngles[FINGER_INDEX]);
+    hand_set_finger_angle(FINGER_MIDDLE, maxAngles[FINGER_MIDDLE]);
+    hand_set_finger_angle(FINGER_RING, maxAngles[FINGER_RING]);
+    hand_set_finger_angle(FINGER_PINKY, minAngles[FINGER_PINKY]);
 }
 
 void gesture_thumbs_up(void)
 {
     /* Thumb extended, others flexed */
-    hand_unflex_finger(FINGER_THUMB);
-    hand_flex_finger(FINGER_INDEX);
-    hand_flex_finger(FINGER_MIDDLE);
-    hand_flex_finger(FINGER_RING);
-    hand_flex_finger(FINGER_PINKY);
+    hand_set_finger_angle(FINGER_THUMB, minAngles[FINGER_THUMB]);
+    hand_set_finger_angle(FINGER_INDEX, maxAngles[FINGER_INDEX]);
+    hand_set_finger_angle(FINGER_MIDDLE, maxAngles[FINGER_MIDDLE]);
+    hand_set_finger_angle(FINGER_RING, maxAngles[FINGER_RING]);
+    hand_set_finger_angle(FINGER_PINKY, maxAngles[FINGER_PINKY]);
 }
 
 void gesture_rest(void)
 {
-    /* Rest is same as open - neutral position */
-    gesture_open();
+    hand_set_finger_angle(FINGER_THUMB, (maxAngles[FINGER_THUMB] + minAngles[FINGER_THUMB])/2);
+    hand_set_finger_angle(FINGER_INDEX, (maxAngles[FINGER_INDEX] + minAngles[FINGER_INDEX])/2);
+    hand_set_finger_angle(FINGER_MIDDLE, (maxAngles[FINGER_MIDDLE] + minAngles[FINGER_MIDDLE])/2);
+    hand_set_finger_angle(FINGER_RING, (maxAngles[FINGER_RING] + minAngles[FINGER_RING])/2);
+    hand_set_finger_angle(FINGER_PINKY, (maxAngles[FINGER_PINKY] + minAngles[FINGER_PINKY])/2);
 }
 
 /*******************************************************************************

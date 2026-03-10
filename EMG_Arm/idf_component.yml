@@ -1,0 +1,10 @@
+# ESP-IDF Component Manager dependencies
+# These are ESP-IDF components (NOT PlatformIO libraries).
+# Run `pio run --target menuconfig` after modifying to refresh the component index.
+
+dependencies:
+  # esp-dsp: required when MODEL_EXPAND_FEATURES=1 (Change 1 — 69-feature FFT)
+  espressif/esp-dsp: ">=2.0.0"
+
+  # TFLite Micro: required when MODEL_USE_MLP=1 (Change E — int8 MLP)
+  # tensorflow/tflite-micro: ">=2.0.0"

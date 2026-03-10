@@ -55,7 +55,7 @@ void servo_hal_init(void)
             .timer_sel  = SERVO_PWM_TIMER,
             .intr_type  = LEDC_INTR_DISABLE,
             .gpio_num   = servo_pins[i],
-            .duty       = SERVO_DUTY_MIN,  /* Start extended (open) */
+            .duty       = servo_hal_degrees_to_duty(90),  /* Start extended (open) */
             .hpoint     = 0
         };
         ESP_ERROR_CHECK(ledc_channel_config(&channel_config));

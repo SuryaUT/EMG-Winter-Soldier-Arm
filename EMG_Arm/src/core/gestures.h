@@ -13,6 +13,7 @@
 #define GESTURES_H
 
 #include <stdint.h>
+#include <string.h>
 #include "config/config.h"
 
 /*******************************************************************************
@@ -25,6 +26,8 @@
  * @param gesture Which gesture to perform
  */
 void gestures_execute(gesture_t gesture);
+
+gesture_t parse_gesture(const char *s);
 
 /**
  * @brief Get the name of a gesture as a string.

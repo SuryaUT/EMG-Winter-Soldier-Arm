@@ -2,9 +2,8 @@
  * @file emg_sensor.h
  * @brief EMG sensor driver for reading muscle signals.
  *
- * This module provides EMG data acquisition. Currently generates fake
- * data for testing (FEATURE_FAKE_EMG=1). When sensors arrive, the
- * implementation switches to real ADC reads without changing the interface.
+ * This module provides EMG data acquisition from ADC channels connected
+ * to MyoWare sensors. Outputs calibrated millivolt values (0-3300 mV).
  *
  * @note This is Layer 2 (Driver).
  */
@@ -34,8 +33,7 @@ typedef struct {
 /**
  * @brief Initialize the EMG sensor system.
  *
- * If FEATURE_FAKE_EMG is enabled, just seeds the random generator.
- * Otherwise, configures ADC channels for real sensor reading.
+ * Configures ADC channels and calibration for real sensor reading.
  */
 void emg_sensor_init(void);
 

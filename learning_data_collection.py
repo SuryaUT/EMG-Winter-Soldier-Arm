@@ -4,18 +4,26 @@ EMG Data Collection Pipeline
 A complete pipeline for collecting, labeling, and classifying EMG signals.
 
 OPTIONS:
-  1. Collect Data    - Run a labeled collection session with timed prompts
+  1. Collect Data    - Run a labeled collection session with timed prompts (requires ESP32)
   2. Inspect Data    - Load saved sessions, view raw EMG and features
   3. Train Classifier - Train LDA on collected data with cross-validation
+  4. Live Prediction - Real-time gesture classification (requires ESP32)
+  5. Visualize LDA   - Decision boundaries and feature space plots
+  6. Benchmark       - Compare LDA/QDA/SVM/MLP classifiers
   q. Quit
 
 FEATURES:
-  - Simulated EMG stream (swap for serial.Serial with real hardware)
+  - Real-time EMG acquisition via ESP32 serial interface
   - Timed prompt system for consistent data collection
-  - Automatic labeling based on prompt timing
+  - Automatic labeling based on prompt timing with onset detection
   - HDF5 storage with metadata
   - Time-domain feature extraction (RMS, WL, ZC, SSC)
   - LDA classifier with evaluation metrics
+  - Prediction smoothing (EMA + majority vote + debounce)
+
+HARDWARE REQUIRED:
+  - ESP32 with EMG sensors connected and firmware flashed
+  - USB serial connection (921600 baud)
 """
 
 import time
@@ -28,11 +36,13 @@ from pathlib import Path
 from datetime import datetime
 import json
 import h5py
-from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
-from sklearn.model_selection import cross_val_score, train_test_split
+from sklearn.discriminant_analysis import LinearDiscriminantAnalysis, QuadraticDiscriminantAnalysis
+from sklearn.model_selection import cross_val_score, train_test_split, cross_val_predict, GroupShuffleSplit, GroupKFold
 from sklearn.metrics import classification_report, confusion_matrix
 import joblib  # For model persistence
 import matplotlib.pyplot as plt
+from scipy.signal import butter, sosfiltfilt, sosfilt, sosfilt_zi  # For label alignment + bandpass
+from serial_stream import RealSerialStream  # ESP32 serial communication
 
 # =============================================================================
 # CONFIGURATION
@@ -41,14 +51,27 @@ NUM_CHANNELS = 4          # Number of EMG channels (MyoWare sensors)
 SAMPLING_RATE_HZ = 1000   # Must match ESP32's EMG_SAMPLE_RATE_HZ
 SERIAL_BAUD = 921600      # High baud rate to prevent serial buffer backlog
 
-# Windowing configuration
-WINDOW_SIZE_MS = 150      # Window size in milliseconds
-WINDOW_OVERLAP = 0.0      # Overlap ratio (0.0 = no overlap, 0.5 = 50% overlap)
+# Windowing configuration (must match ESP32 inference timing)
+WINDOW_SIZE_MS = 150      # Window size in milliseconds (150 samples at 1kHz)
+HOP_SIZE_MS = 25          # Hop/stride in milliseconds (25 samples at 1kHz)
+MAJORITY_WINDOW = 10
+
+# Hand classifier channel selection
+# The hand gesture classifier uses only forearm channels (ch0-ch2).
+# The bicep channel (ch3) is excluded to prevent bicep activity from
+# corrupting hand gesture classification. Ch3 is reserved for independent
+# bicep envelope processing (see Phase 5).
+HAND_CHANNELS = [0, 1, 2]  # Forearm channels only (excludes bicep ch3)
 
 # Labeling configuration
 GESTURE_HOLD_SEC = 3.0    # How long to hold each gesture
 REST_BETWEEN_SEC = 2.0    # Rest period between gestures
 REPS_PER_GESTURE = 3      # Repetitions per gesture in a session
+LABEL_SHIFT_MS = 150      # Shift label lookup forward by this many ms to account
+                          # for human reaction time.  A 150ms window labelled at its
+                          # start_time can straddle a prompt transition; using
+                          # start_time + shift assigns the label based on what the
+                          # user is actually doing at the window's centre.
 
 # Storage configuration
 DATA_DIR = Path("collected_data")  # Directory to store session files
@@ -64,6 +87,10 @@ USER_ID = "user_001"               # Current user ID (change per user)
 ENABLE_LABEL_ALIGNMENT = True     # Enable/disable automatic label alignment
 ONSET_THRESHOLD = 2             # Signal must exceed baseline + threshold * std
 ONSET_SEARCH_MS = 2000           # Search window after prompt (ms)
+# Change 0: after onset detection shifts the label start backward, additionally
+# relabel the first LABEL_FORWARD_SHIFT_MS of each gesture run as "rest" to skip
+# the EMG transient at gesture onset. Paired with reducing TRANSITION_START_MS.
+LABEL_FORWARD_SHIFT_MS = 100     # ms of each gesture onset to relabel as rest
 
 # =============================================================================
 # TRANSITION WINDOW FILTERING
@@ -73,7 +100,7 @@ ONSET_SEARCH_MS = 2000           # Search window after prompt (ms)
 # This is standard practice in EMG research (see Frontiers Neurorobotics 2023).
 
 DISCARD_TRANSITION_WINDOWS = True  # Enable/disable transition filtering during training
-TRANSITION_START_MS = 300          # Discard windows within this time AFTER gesture starts
+TRANSITION_START_MS = 200          # Discard windows within this time AFTER gesture starts
 TRANSITION_END_MS = 150            # Discard windows within this time BEFORE gesture ends
 
 # =============================================================================
@@ -85,7 +112,9 @@ class EMGSample:
     """Single sample from all channels at one point in time."""
     timestamp: float                    # Python-side timestamp (seconds, monotonic)
     channels: list[float]               # Raw ADC values per channel
-    esp_timestamp_ms: Optional[int] = None  # Optional: timestamp from ESP32
+    # DEPRECATED: esp_timestamp_ms is no longer used. Python-side timestamps are used
+    # for label alignment. Kept for backward compatibility with old serialized data.
+    esp_timestamp_ms: Optional[int] = None
 
 
 @dataclass
@@ -109,80 +138,6 @@ class EMGWindow:
     def get_channel(self, ch: int) -> np.ndarray:
         """Get single channel as 1D array."""
         return np.array([s.channels[ch] for s in self.samples])
-
-
-# =============================================================================
-# SIMULATED EMG STREAM (Mimics what ESP32 would send over serial)
-# =============================================================================
-
-class SimulatedEMGStream:
-    """
-    Simulates ESP32 sending EMG data over serial.
-
-    In reality, you'd replace this with:
-        import serial
-        ser = serial.Serial('COM3', 115200)
-        line = ser.readline()
-
-    The ESP32 would send lines like:
-        "1234,512,489,501,523\n"  (timestamp_ms, ch0, ch1, ch2, ch3)
-    """
-
-    def __init__(self, num_channels: int = 4, sample_rate: int = 1000):
-        self.num_channels = num_channels
-        self.sample_rate = sample_rate
-        self.running = False
-        self.output_queue = queue.Queue()
-        self._thread = None
-        self._esp_time_ms = 0
-
-    def start(self):
-        """Start the simulated data stream."""
-        self.running = True
-        self._thread = threading.Thread(target=self._generate_data, daemon=True)
-        self._thread.start()
-        print(f"[SIM] Started simulated EMG stream: {self.num_channels} channels @ {self.sample_rate}Hz")
-
-    def stop(self):
-        """Stop the simulated data stream."""
-        self.running = False
-        if self._thread:
-            self._thread.join(timeout=1.0)
-        print("[SIM] Stopped simulated EMG stream")
-
-    def readline(self) -> Optional[str]:
-        """
-        Mimics serial.readline() - blocks until data available.
-        Returns line in format: "timestamp_ms,ch0,ch1,ch2,ch3"
-        """
-        try:
-            return self.output_queue.get(timeout=1.0)
-        except queue.Empty:
-            return None
-
-    def _generate_data(self):
-        """Background thread that generates fake EMG data."""
-        interval = 1.0 / self.sample_rate
-
-        while self.running:
-            # Simulate EMG signal: baseline noise + occasional bursts
-            channels = []
-            for ch in range(self.num_channels):
-                # Base noise (typical ADC noise around 512 center for 10-bit ADC)
-                base = 512 + np.random.randn() * 10
-
-                # Occasionally add muscle activation burst (simulates gesture)
-                if np.random.random() < 0.01:  # 1% chance each sample
-                    base += np.random.randn() * 100
-
-                channels.append(int(np.clip(base, 0, 1023)))
-
-            # Format like ESP32 would send
-            line = f"{self._esp_time_ms},{','.join(map(str, channels))}\n"
-            self.output_queue.put(line)
-
-            self._esp_time_ms += 1  # Increment ESP32 timestamp
-            time.sleep(interval)
 
 
 # =============================================================================
@@ -228,7 +183,7 @@ class EMGParser:
             sample = EMGSample(
                 timestamp=time.perf_counter(),  # High-resolution monotonic clock
                 channels=channels,
-                esp_timestamp_ms=None  # No longer using ESP32 timestamp
+                esp_timestamp_ms=None  # Deprecated field, kept for compatibility
             )
 
             self.samples_parsed += 1
@@ -256,27 +211,36 @@ class Windower:
       - Sweet spot: 150-250ms for EMG gesture recognition
     """
 
-    def __init__(self, window_size_ms: int, sample_rate: int, overlap: float = 0.0):
+    def __init__(self, window_size_ms: int, sample_rate: int, hop_size_ms: int = 25):
         self.window_size_ms = window_size_ms
         self.sample_rate = sample_rate
-        self.overlap = overlap
+        self.hop_size_ms = hop_size_ms
 
-        # Calculate window size in samples
+        # Calculate window and step size in samples (hop-based, not overlap-based)
         self.window_size_samples = int(window_size_ms / 1000 * sample_rate)
-        self.step_size_samples = int(self.window_size_samples * (1 - overlap))
+        self.step_size_samples = int(hop_size_ms / 1000 * sample_rate)
 
         # Buffer for incoming samples
         self.buffer: list[EMGSample] = []
         self.window_count = 0
 
+        # Verification: Print first 10 window start indices and timestamps
+        self._verification_printed = False
+
         print(f"[Windower] Window: {window_size_ms}ms = {self.window_size_samples} samples")
-        print(f"[Windower] Step: {self.step_size_samples} samples (overlap={overlap*100:.0f}%)")
+        print(f"[Windower] Hop: {hop_size_ms}ms = {self.step_size_samples} samples")
 
     def add_sample(self, sample: EMGSample) -> Optional[EMGWindow]:
         """
         Add a sample to the buffer. Returns a window if we have enough samples.
 
         Returns None if buffer isn't full yet.
+
+        Window timing (at 1kHz):
+          - Window 0: samples 0-149,   start index 0,   time 0.000s
+          - Window 1: samples 25-174,  start index 25,  time 0.025s
+          - Window 2: samples 50-199,  start index 50,  time 0.050s
+          - ...
         """
         self.buffer.append(sample)
 
@@ -290,6 +254,16 @@ class Windower:
                 end_time=window_samples[-1].timestamp,
                 samples=window_samples.copy()
             )
+
+            # Verification: Print first 10 window start indices and timestamps
+            if not self._verification_printed and self.window_count < 10:
+                start_idx = self.window_count * self.step_size_samples
+                start_time_sec = start_idx / self.sample_rate
+                print(f"[Windower] Window {self.window_count}: start_idx={start_idx}, time={start_time_sec:.3f}s")
+                if self.window_count == 9:
+                    self._verification_printed = True
+                    print(f"[Windower] Verified: 150-sample windows, {self.step_size_samples}-sample hop")
+
             self.window_count += 1
 
             # Slide buffer by step size
@@ -323,6 +297,7 @@ class GesturePrompt:
     gesture_name: str       # e.g., "index_flex", "rest", "fist"
     duration_sec: float     # How long to hold this gesture
     start_time: float = 0.0 # Filled in by scheduler when session starts
+    trial_id: int = -1      # Unique ID for this trial (gesture repetition)
 
 
 @dataclass
@@ -369,18 +344,24 @@ class PromptScheduler:
         self.session_start_time: Optional[float] = None
 
     def _build_schedule(self) -> PromptSchedule:
-        """Create the sequence of prompts."""
+        """Create the sequence of prompts with unique trial_ids."""
         prompts = []
+        trial_counter = 0
 
-        # Initial rest period
-        prompts.append(GesturePrompt("rest", self.rest_sec))
+        # Initial rest period (trial_id = 0)
+        prompts.append(GesturePrompt("rest", self.rest_sec, trial_id=trial_counter))
+        trial_counter += 1
 
         # For each repetition
         for rep in range(self.reps):
             # Cycle through all gestures
             for gesture in self.gestures:
-                prompts.append(GesturePrompt(gesture, self.hold_sec))
-                prompts.append(GesturePrompt("rest", self.rest_sec))
+                # Gesture trial
+                prompts.append(GesturePrompt(gesture, self.hold_sec, trial_id=trial_counter))
+                trial_counter += 1
+                # Rest trial (each rest is its own trial to avoid leakage)
+                prompts.append(GesturePrompt("rest", self.rest_sec, trial_id=trial_counter))
+                trial_counter += 1
 
         return PromptSchedule(prompts)
 
@@ -433,6 +414,25 @@ class PromptScheduler:
 
         return "unlabeled"
 
+    def get_trial_id_for_time(self, timestamp: float) -> int:
+        """
+        Get the trial_id for a specific timestamp.
+
+        Each gesture repetition has a unique trial_id. Windows from the same
+        trial MUST stay together during train/test splitting to prevent leakage.
+        """
+        if self.session_start_time is None:
+            return -1
+
+        elapsed = timestamp - self.session_start_time
+
+        for prompt in self.schedule.prompts:
+            prompt_end = prompt.start_time + prompt.duration_sec
+            if prompt.start_time <= elapsed < prompt_end:
+                return prompt.trial_id
+
+        return -1
+
     def print_schedule(self):
         """Print the full prompt schedule."""
         print("\n" + "-" * 40)
@@ -444,75 +444,9 @@ class PromptScheduler:
 
 
 # =============================================================================
-# SIMULATED EMG STREAM (Gesture-aware signal generation)
-# =============================================================================
-
-class GestureAwareEMGStream(SimulatedEMGStream):
-    """
-    Enhanced simulation that generates different EMG patterns based on
-    which gesture is currently being prompted.
-
-    This makes the simulated data more realistic for testing your pipeline.
-    Each gesture activates different "muscles" (channels) with different intensities.
-    """
-
-    # Define which channels activate for each gesture (0-1 intensity per channel)
-    GESTURE_PATTERNS = {
-        "rest":        [0.0, 0.0, 0.0, 0.0],
-        "open":        [0.3, 0.3, 0.3, 0.3],  # Moderate all channels (extension)
-        "fist":        [0.7, 0.7, 0.6, 0.6],  # All channels active (flexion)
-        "hook_em":     [0.8, 0.2, 0.7, 0.1],  # Index + pinky extended (ch0 + ch2)
-        "thumbs_up":   [0.1, 0.1, 0.2, 0.8],  # Thumb dominant (ch3)
-    }
-
-    def __init__(self, num_channels: int = 4, sample_rate: int = 1000):
-        super().__init__(num_channels, sample_rate)
-        self.current_gesture = "rest"
-        self._gesture_lock = threading.Lock()
-
-    def set_gesture(self, gesture: str):
-        """Set the current gesture being performed."""
-        with self._gesture_lock:
-            self.current_gesture = gesture
-
-    def _generate_data(self):
-        """Generate EMG data based on current gesture."""
-        interval = 1.0 / self.sample_rate
-
-        while self.running:
-            with self._gesture_lock:
-                gesture = self.current_gesture
-
-            # Get activation pattern for current gesture
-            pattern = self.GESTURE_PATTERNS.get(gesture, [0.0] * self.num_channels)
-
-            channels = []
-            for ch in range(self.num_channels):
-                # Base signal around 512 (10-bit ADC center)
-                base = 512
-
-                # Add noise (always present)
-                noise = np.random.randn() * 10
-
-                # Add muscle activation based on pattern
-                activation = pattern[ch] * np.random.randn() * 150  # Scaled EMG burst
-
-                # Combine and clip to ADC range
-                value = int(np.clip(base + noise + activation, 0, 1023))
-                channels.append(value)
-
-            # Format like ESP32 would send
-            line = f"{self._esp_time_ms},{','.join(map(str, channels))}\n"
-            self.output_queue.put(line)
-
-            self._esp_time_ms += 1
-            time.sleep(interval)
-
-
-# =============================================================================
 # LABEL ALIGNMENT (Simple Onset Detection)
 # =============================================================================
-from scipy.signal import butter, sosfiltfilt
+# NOTE: butter and sosfiltfilt imported at top of file
 
 
 def align_labels_with_onset(
@@ -608,9 +542,10 @@ def filter_transition_windows(
     labels: list[str],
     start_times: np.ndarray,
     end_times: np.ndarray,
+    trial_ids: Optional[np.ndarray] = None,
     transition_start_ms: float = TRANSITION_START_MS,
     transition_end_ms: float = TRANSITION_END_MS
-) -> tuple[np.ndarray, np.ndarray, list[str]]:
+) -> tuple[np.ndarray, np.ndarray, list[str], Optional[np.ndarray]]:
     """
     Filter out windows that fall within transition zones at gesture boundaries.
 
@@ -624,14 +559,15 @@ def filter_transition_windows(
         labels: String labels (n_windows,)
         start_times: Window start times in seconds (n_windows,)
         end_times: Window end times in seconds (n_windows,)
+        trial_ids: Trial IDs for train/test splitting (n_windows,) - optional
         transition_start_ms: Discard windows within this time after gesture start
         transition_end_ms: Discard windows within this time before gesture end
 
     Returns:
-        Filtered (X, y, labels) with transition windows removed
+        Filtered (X, y, labels, trial_ids) with transition windows removed
     """
     if len(X) == 0:
-        return X, y, labels
+        return X, y, labels, trial_ids
 
     transition_start_sec = transition_start_ms / 1000.0
     transition_end_sec = transition_end_ms / 1000.0
@@ -673,13 +609,14 @@ def filter_transition_windows(
     X_filtered = X[keep_mask]
     y_filtered = y[keep_mask]
     labels_filtered = [l for l, keep in zip(labels, keep_mask) if keep]
+    trial_ids_filtered = trial_ids[keep_mask] if trial_ids is not None else None
 
     n_removed = len(X) - len(X_filtered)
     if n_removed > 0:
         print(f"[Filter] Removed {n_removed} transition windows ({n_removed/len(X)*100:.1f}%)")
         print(f"[Filter] Kept {len(X_filtered)} windows for training")
 
-    return X_filtered, y_filtered, labels_filtered
+    return X_filtered, y_filtered, labels_filtered, trial_ids_filtered
 
 
 # =============================================================================
@@ -718,6 +655,7 @@ class SessionStorage:
         windows: list[EMGWindow],
         labels: list[str],
         metadata: SessionMetadata,
+        trial_ids: Optional[list[int]] = None,
         raw_samples: Optional[list[EMGSample]] = None,
         session_start_time: Optional[float] = None,
         enable_alignment: bool = ENABLE_LABEL_ALIGNMENT
@@ -733,6 +671,7 @@ class SessionStorage:
             windows: List of EMGWindow objects (no label info)
             labels: List of gesture labels, parallel to windows
             metadata: Session metadata
+            trial_ids: List of trial IDs, parallel to windows (for proper train/test splitting)
             raw_samples: Raw samples (required for alignment)
             session_start_time: When session started (required for alignment)
             enable_alignment: Whether to perform automatic label alignment
@@ -774,6 +713,28 @@ class SessionStorage:
 
             changed = sum(1 for a, b in zip(labels, aligned_labels) if a != b)
             print(f"[Storage] Labels aligned: {changed}/{len(labels)} windows shifted")
+
+            # Change 0: relabel the first LABEL_FORWARD_SHIFT_MS of each gesture
+            # run as 'rest' to remove the EMG onset transient from training data.
+            if LABEL_FORWARD_SHIFT_MS > 0:
+                shift_n = max(1, round(LABEL_FORWARD_SHIFT_MS / HOP_SIZE_MS))
+                shifted = list(aligned_labels)
+                for i in range(len(aligned_labels)):
+                    if aligned_labels[i] == 'rest':
+                        continue
+                    # Count consecutive same-label windows immediately before this one
+                    prior_same = 0
+                    j = i - 1
+                    while j >= 0 and aligned_labels[j] == aligned_labels[i]:
+                        prior_same += 1
+                        j -= 1
+                    if prior_same < shift_n:
+                        shifted[i] = 'rest'
+                n_shifted = sum(1 for a, b in zip(aligned_labels, shifted) if a != b)
+                aligned_labels = shifted
+                print(f"[Storage] Forward shift ({LABEL_FORWARD_SHIFT_MS}ms, "
+                      f"{shift_n} windows): {n_shifted} relabeled as rest")
+
         elif enable_alignment:
             print("[Storage] Warning: No raw samples, skipping alignment")
 
@@ -806,6 +767,14 @@ class SessionStorage:
 
             window_ids = np.array([w.window_id for w in windows], dtype=np.int32)
             windows_grp.create_dataset('window_ids', data=window_ids)
+
+            # Store trial_ids for proper train/test splitting (no trial leakage)
+            if trial_ids is not None:
+                trial_ids_arr = np.array(trial_ids, dtype=np.int32)
+                windows_grp.create_dataset('trial_ids', data=trial_ids_arr)
+                f.attrs['has_trial_ids'] = True
+            else:
+                f.attrs['has_trial_ids'] = False
 
             windows_grp.create_dataset('start_times', data=start_times)
             windows_grp.create_dataset('end_times', data=end_times)
@@ -919,7 +888,7 @@ class SessionStorage:
             label_to_idx_pre = {name: idx for idx, name in enumerate(label_names_pre)}
             y_pre = np.array([label_to_idx_pre[l] for l in labels], dtype=np.int32)
 
-            X, y_pre, labels = filter_transition_windows(
+            X, y_pre, labels, _ = filter_transition_windows(
                 X, y_pre, labels, start_times, end_times
             )
 
@@ -931,7 +900,7 @@ class SessionStorage:
         print(f"[Storage] Labels: {label_names}")
         return X, y, label_names
 
-    def load_all_for_training(self, filter_transitions: bool = DISCARD_TRANSITION_WINDOWS) -> tuple[np.ndarray, np.ndarray, list[str], list[str]]:
+    def load_all_for_training(self, filter_transitions: bool = DISCARD_TRANSITION_WINDOWS) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[str], list[str]]:
         """
         Load ALL sessions combined into a single training dataset.
 
@@ -941,6 +910,8 @@ class SessionStorage:
         Returns:
             X: Combined EMG windows from all sessions (n_total_windows, samples, channels)
             y: Combined labels as integers (n_total_windows,)
+            trial_ids: Combined trial IDs for proper train/test splitting (n_total_windows,)
+            session_indices: Per-window session index (0..n_sessions-1) for session normalization
             label_names: Sorted list of unique gesture labels across all sessions
             session_ids: List of session IDs that were loaded
 
@@ -958,10 +929,13 @@ class SessionStorage:
 
         all_X = []
         all_labels = []
+        all_trial_ids = []  # Track trial_ids for proper train/test splitting
+        all_session_indices = []  # Per-window session index for session normalization
         loaded_sessions = []
         reference_shape = None
         total_removed = 0
         total_original = 0
+        trial_id_offset = 0  # Offset trial_ids across sessions to ensure global uniqueness
 
         for session_id in sessions:
             filepath = self.get_session_filepath(session_id)
@@ -971,6 +945,15 @@ class SessionStorage:
                 labels_raw = f['windows/labels'][:]
                 start_times = f['windows/start_times'][:]
                 end_times = f['windows/end_times'][:]
+
+                # Load trial_ids if available (new files), otherwise generate from index
+                if 'windows/trial_ids' in f:
+                    trial_ids = f['windows/trial_ids'][:] + trial_id_offset
+                else:
+                    # Legacy file without trial_ids: assign unique trial_id per window
+                    # This is conservative - treats each window as separate trial
+                    print(f"[Storage] WARNING: {session_id} missing trial_ids, generating from indices")
+                    trial_ids = np.arange(len(X), dtype=np.int32) + trial_id_offset
 
             # Validate shape compatibility
             if reference_shape is None:
@@ -997,14 +980,22 @@ class SessionStorage:
                 temp_label_to_idx = {name: idx for idx, name in enumerate(temp_label_names)}
                 temp_y = np.array([temp_label_to_idx[l] for l in labels], dtype=np.int32)
 
-                X, temp_y, labels = filter_transition_windows(
-                    X, temp_y, labels, start_times, end_times
+                X, temp_y, labels, trial_ids = filter_transition_windows(
+                    X, temp_y, labels, start_times, end_times, trial_ids=trial_ids
                 )
                 total_removed += original_count - len(X)
 
+            current_session_idx = len(all_X)  # 0-based index before appending
             all_X.append(X)
             all_labels.extend(labels)
+            all_trial_ids.extend(trial_ids.tolist())
+            all_session_indices.extend([current_session_idx] * len(X))
             loaded_sessions.append(session_id)
+
+            # Update trial_id offset for next session (ensure global uniqueness)
+            if len(trial_ids) > 0:
+                trial_id_offset = max(trial_ids) + 1
+
             print(f"[Storage]   - {session_id}: {len(X)} windows" +
                   (f" (was {original_count})" if filter_transitions and len(X) != original_count else ""))
 
@@ -1013,19 +1004,23 @@ class SessionStorage:
 
         # Combine all data
         X_combined = np.concatenate(all_X, axis=0)
+        trial_ids_combined = np.array(all_trial_ids, dtype=np.int32)
+        session_indices_combined = np.array(all_session_indices, dtype=np.int32)
 
         # Create unified label mapping across all sessions
         label_names = sorted(set(all_labels))
         label_to_idx = {name: idx for idx, name in enumerate(label_names)}
         y_combined = np.array([label_to_idx[l] for l in all_labels], dtype=np.int32)
 
+        n_unique_trials = len(np.unique(trial_ids_combined))
         print(f"[Storage] Combined dataset: X{X_combined.shape}, y{y_combined.shape}")
+        print(f"[Storage] Unique trials: {n_unique_trials} (for proper train/test splitting)")
         if filter_transitions and total_removed > 0:
             print(f"[Storage] Total removed: {total_removed}/{total_original} windows ({total_removed/total_original*100:.1f}%)")
         print(f"[Storage] Labels: {label_names}")
         print(f"[Storage] Sessions loaded: {len(loaded_sessions)}")
 
-        return X_combined, y_combined, label_names, loaded_sessions
+        return X_combined, y_combined, trial_ids_combined, session_indices_combined, label_names, loaded_sessions
 
     def list_sessions(self) -> list[str]:
         """List all available session IDs."""
@@ -1046,102 +1041,23 @@ class SessionStorage:
 
 
 # =============================================================================
-# COLLECTION LOOP (Core collection pattern)
-# =============================================================================
-
-def run_collection_demo(duration_seconds: float = 5.0):
-    """
-    Demonstrates the core data collection loop.
-
-    This is the pattern you'll use with real hardware - only the
-    data source changes (SimulatedEMGStream -> serial.Serial).
-    """
-    print("\n" + "=" * 60)
-    print("EMG DATA COLLECTION DEMO")
-    print("=" * 60)
-
-    # Initialize components
-    stream = SimulatedEMGStream(num_channels=NUM_CHANNELS, sample_rate=SAMPLING_RATE_HZ)
-    parser = EMGParser(num_channels=NUM_CHANNELS)
-
-    # Storage for collected samples
-    collected_samples: list[EMGSample] = []
-
-    # Start the stream
-    stream.start()
-    start_time = time.perf_counter()
-
-    print(f"\nCollecting for {duration_seconds} seconds...")
-    print("(In real use, this would read from serial port)\n")
-
-    try:
-        while (time.perf_counter() - start_time) < duration_seconds:
-            # Read line from stream (blocks briefly if no data)
-            line = stream.readline()
-
-            if line:
-                # Parse into structured sample
-                sample = parser.parse_line(line)
-
-                if sample:
-                    collected_samples.append(sample)
-
-                    # Print progress every 500 samples
-                    if len(collected_samples) % 500 == 0:
-                        elapsed = time.perf_counter() - start_time
-                        rate = len(collected_samples) / elapsed
-                        print(f"  Collected {len(collected_samples)} samples "
-                              f"({rate:.1f} samples/sec)")
-
-    except KeyboardInterrupt:
-        print("\n[Interrupted by user]")
-
-    finally:
-        stream.stop()
-
-    # Report results
-    print("\n" + "-" * 40)
-    print("COLLECTION RESULTS")
-    print("-" * 40)
-    print(f"Total samples collected: {len(collected_samples)}")
-    print(f"Parse errors: {parser.parse_errors}")
-    print(f"Actual duration: {time.perf_counter() - start_time:.2f}s")
-
-    if collected_samples:
-        actual_rate = len(collected_samples) / (time.perf_counter() - start_time)
-        print(f"Effective sample rate: {actual_rate:.1f} Hz")
-
-        # Show sample data structure
-        print("\nExample sample:")
-        s = collected_samples[0]
-        print(f"  timestamp: {s.timestamp:.6f}")
-        print(f"  channels: {s.channels}")
-        print(f"  esp_timestamp_ms: {s.esp_timestamp_ms}")
-
-        # Quick statistics
-        data = np.array([s.channels for s in collected_samples])
-        print(f"\nChannel statistics (mean/std):")
-        for ch in range(NUM_CHANNELS):
-            print(f"  Ch{ch}: {data[:, ch].mean():.1f} / {data[:, ch].std():.1f}")
-
-    return collected_samples
-
-
-# =============================================================================
-# COLLECTION SESSION
+# COLLECTION SESSION (Requires ESP32 hardware)
 # =============================================================================
 
 def run_labeled_collection_demo():
     """
     Run a labeled EMG collection session:
-      1. Prompt scheduler guides the user through gestures
-      2. EMG stream generates/collects signals
-      3. Windower groups samples into fixed-size windows
-      4. Labels are assigned based on which prompt was active
-      5. Session is saved to HDF5 with user ID
+      1. Connect to ESP32 via serial
+      2. Prompt scheduler guides the user through gestures
+      3. EMG stream collects real signals
+      4. Windower groups samples into fixed-size windows
+      5. Labels are assigned based on which prompt was active
+      6. Session is saved to HDF5 with user ID
+
+    REQUIRES: ESP32 hardware connected via USB.
     """
     print("\n" + "=" * 60)
-    print("LABELED EMG COLLECTION")
+    print("LABELED EMG COLLECTION (ESP32 Required)")
     print("=" * 60)
 
     # Get user ID
@@ -1164,18 +1080,28 @@ def run_labeled_collection_demo():
     )
     scheduler.print_schedule()
 
-    # Create components
-    stream = GestureAwareEMGStream(num_channels=NUM_CHANNELS, sample_rate=SAMPLING_RATE_HZ)
+    # Connect to ESP32
+    print("\n[Connecting to ESP32...]")
+    stream = RealSerialStream()
+    try:
+        stream.connect(timeout=5.0)
+        print(f"  Connected: {stream.device_info}")
+    except Exception as e:
+        print(f"  ERROR: Failed to connect to ESP32: {e}")
+        print("  Make sure the ESP32 is connected and firmware is flashed.")
+        return [], []
+
     parser = EMGParser(num_channels=NUM_CHANNELS)
     windower = Windower(
         window_size_ms=WINDOW_SIZE_MS,
         sample_rate=SAMPLING_RATE_HZ,
-        overlap=WINDOW_OVERLAP
+        hop_size_ms=HOP_SIZE_MS
     )
 
-    # Storage for windows and labels (kept separate to enforce training/inference separation)
+    # Storage for windows, labels, and trial_ids (kept separate to enforce training/inference separation)
     collected_windows: list[EMGWindow] = []
     collected_labels: list[str] = []
+    collected_trial_ids: list[int] = []  # Track trial_id for proper train/test splitting
     last_prompt_name = None
 
     # Start collection
@@ -1201,9 +1127,6 @@ def run_labeled_collection_demo():
                     print(f"\n  [{elapsed:5.1f}s] >>> {prompt.gesture_name.upper()} <<<")
                 last_prompt_name = prompt.gesture_name
 
-                # Update simulated stream to generate appropriate signal
-                stream.set_gesture(prompt.gesture_name)
-
             # Read and parse data
             line = stream.readline()
             if line:
@@ -1212,16 +1135,21 @@ def run_labeled_collection_demo():
                     # Try to form a window
                     window = windower.add_sample(sample)
                     if window:
-                        # Store window and label separately (training/inference separation)
-                        label = scheduler.get_label_for_time(window.start_time)
+                        # Store window, label, and trial_id separately (training/inference separation)
+                        # Shift label lookup forward to align with actual muscle activation
+                        label_time = window.start_time + LABEL_SHIFT_MS / 1000.0
+                        label = scheduler.get_label_for_time(label_time)
+                        trial_id = scheduler.get_trial_id_for_time(label_time)
                         collected_windows.append(window)
                         collected_labels.append(label)
+                        collected_trial_ids.append(trial_id)
 
     except KeyboardInterrupt:
         print("\n[Interrupted by user]")
 
     finally:
         stream.stop()
+        stream.disconnect()
 
     # Report results
     print("\n" + "=" * 60)
@@ -1275,11 +1203,14 @@ def run_labeled_collection_demo():
                 notes=""
             )
 
-            # Pass windows and labels separately (enforces separation)
-            filepath = storage.save_session(collected_windows, collected_labels, metadata)
+            # Pass windows, labels, and trial_ids separately (enforces separation)
+            filepath = storage.save_session(
+                collected_windows, collected_labels, metadata,
+                trial_ids=collected_trial_ids
+            )
             print(f"\nSession saved! ID: {session_id}")
 
-    return collected_windows, collected_labels
+    return collected_windows, collected_labels, collected_trial_ids
 
 
 # =============================================================================
@@ -1405,18 +1336,19 @@ def run_storage_demo():
             transitions.append((i, label_names[y[i]]))
             current_label = y[i]
 
-    # Define colors for gesture markers
+    # Define colors for gesture markers (matches GUI color scheme)
     def get_gesture_color(name):
-        if 'index' in name.lower():
-            return 'green'
-        elif 'fist' in name.lower():
-            return 'blue'
-        elif 'rest' in name.lower():
+        name_lower = name.lower()
+        if 'rest' in name_lower:
             return 'gray'
-        elif 'thumb' in name.lower():
+        elif 'open' in name_lower:
+            return 'cyan'
+        elif 'fist' in name_lower:
+            return 'blue'
+        elif 'hook' in name_lower:
             return 'orange'
-        elif 'middle' in name.lower():
-            return 'purple'
+        elif 'thumb' in name_lower:
+            return 'green'
         return 'red'
 
     feature_titles = ['RMS', 'Waveform Length (WL)', 'Zero Crossings (ZC)', 'Slope Sign Changes (SSC)']
@@ -1505,117 +1437,561 @@ def run_storage_demo():
 
 class EMGFeatureExtractor:
     """
-    Extracts time-domain features from EMG windows.
+    Extracts time-domain and frequency-domain features from EMG windows.
 
-    Features per channel:
-      - RMS (Root Mean Square): Signal power/amplitude
-      - WL (Waveform Length): Signal complexity
-      - ZC (Zero Crossings): Frequency content indicator
-      - SSC (Slope Sign Changes): Frequency content indicator
+    Change 1 — expanded feature set (expanded=True, default):
+      Per channel (20 features):
+        TD-4 (legacy): RMS, WL, ZC, SSC
+        TD extended:   MAV, VAR, IEMG, WAMP
+        AR model:      AR1, AR2, AR3, AR4  (4th-order via Yule-Walker)
+        Frequency:     MNF, MDF, PKF, MNP  (mean/median/peak freq, mean power)
+        Band power:    BP0(20-80Hz), BP1(80-150Hz), BP2(150-250Hz), BP3(250-450Hz)
+      Cross-channel (cross_channel=True, default):
+        For each channel pair (i,j): Pearson correlation, log-RMS ratio, covariance
+        For 3 hand channels: 3 pairs × 3 = 9 cross-channel features
+      Total for HAND_CHANNELS=[0,1,2]: 20×3 + 9 = 69 features
 
-    These 4 features × N channels = 4N features per window.
-    For 4 channels: 16 features total.
+    Legacy mode (expanded=False): 4 features per channel only (RMS, WL, ZC, SSC).
+    Old pickled models automatically use legacy mode via __setstate__.
 
-    IMPORTANT: Per-window centering (DC offset removal) is applied before
-    feature extraction. This is critical because:
-      - EMG sensors have DC offset (e.g., ~512 for 10-bit ADC)
-      - Zero crossings require signal centered around 0
-      - Per-window centering is causal (works in real-time inference)
-      - Global centering would leak information across windows
-
-    LESSON: These features are:
-      - Fast to compute (good for real-time)
-      - Work well with LDA
-      - Proven effective for EMG gesture recognition
+    IMPORTANT: Per-window DC removal (mean subtraction) is applied before all
+    features. This is causal (uses only data within the current window).
     """
 
-    def __init__(self, zc_threshold_percent: float = 0.1, ssc_threshold_percent: float = 0.1):
+    # Feature key ordering — determines output vector layout
+    _LEGACY_KEYS = ['rms', 'wl', 'zc', 'ssc']
+    _EXPANDED_KEYS = [
+        'rms',  'wl',   'zc',   'ssc',   # TD-4
+        'mav',  'var',  'iemg', 'wamp',  # TD extended
+        'ar1',  'ar2',  'ar3',  'ar4',   # AR(4) model
+        'mnf',  'mdf',  'pkf',  'mnp',   # Frequency descriptors
+        'bp0',  'bp1',  'bp2',  'bp3',   # Band powers
+    ]
+    # Keys that are amplitude-dependent and should be divided by norm_factor
+    _NORM_KEYS = {'rms', 'wl', 'mav', 'iemg'}
+
+    def __init__(self,
+                 zc_threshold_percent: float = 0.1,
+                 ssc_threshold_percent: float = 0.1,
+                 channels: Optional[list[int]] = None,
+                 normalize: bool = True,
+                 expanded: bool = True,
+                 cross_channel: bool = True,
+                 fft_n: int = 256,
+                 fs: float = float(SAMPLING_RATE_HZ),
+                 reinhard: bool = False,
+                 bandpass: bool = True):
         """
         Args:
-            zc_threshold_percent: ZC threshold as fraction of signal RMS
-            ssc_threshold_percent: SSC threshold as fraction of signal RMS squared
+            zc_threshold_percent: ZC/WAMP threshold as fraction of RMS.
+            ssc_threshold_percent: SSC threshold as fraction of RMS squared.
+            channels: Channel indices to extract features from; None = all.
+            normalize: Divide amplitude-dependent features by total RMS across
+                       channels (makes model robust to impedance shifts).
+            expanded: Use full 20-feature/channel set (Change 1). False = legacy
+                      4-feature/channel set for backward compatibility.
+            cross_channel: Append pairwise cross-channel features (correlation,
+                           log-RMS ratio, covariance). Only when expanded=True.
+            fft_n: FFT size for frequency features (zero-pads window if needed).
+            fs: Sampling frequency in Hz (used for frequency axis).
+            reinhard: Change 4 — apply Reinhard tone-mapping (64·x/(32+|x|))
+                      before feature extraction. Must match MODEL_USE_REINHARD in
+                      firmware model_weights.h. Default False.
+            bandpass: Apply 20-450 Hz bandpass filter before feature extraction.
+                      Must be True to match firmware IIR bandpass. Default True.
         """
-        self.zc_threshold_percent = zc_threshold_percent
+        self.zc_threshold_percent  = zc_threshold_percent
         self.ssc_threshold_percent = ssc_threshold_percent
+        self.channels      = channels
+        self.normalize     = normalize
+        self.expanded      = expanded
+        self.cross_channel = cross_channel
+        self.fft_n         = fft_n
+        self.fs            = fs
+        self.reinhard      = reinhard
+        self.bandpass      = bandpass
+
+        # Pre-compute bandpass SOS coefficients (2nd-order Butterworth, 20-450 Hz)
+        # Matches firmware IIR biquad bandpass in inference.c
+        if self.bandpass:
+            nyq = self.fs / 2.0
+            self._bp_sos = butter(2, [20.0 / nyq, 450.0 / nyq], btype='band', output='sos')
+        else:
+            self._bp_sos = None
+
+    def __setstate__(self, state: dict):
+        """Restore pickle and add defaults for attributes added in Change 1+."""
+        self.__dict__.update(state)
+        if 'expanded'      not in state: self.expanded      = False
+        if 'cross_channel' not in state: self.cross_channel = False
+        if 'fft_n'         not in state: self.fft_n         = 256
+        if 'fs'            not in state: self.fs            = float(SAMPLING_RATE_HZ)
+        if 'reinhard'      not in state: self.reinhard      = False
+        if 'bandpass'      not in state: self.bandpass      = False
+        # Reconstruct SOS coefficients for bandpass filter
+        if self.bandpass:
+            nyq = self.fs / 2.0
+            self._bp_sos = butter(2, [20.0 / nyq, 450.0 / nyq], btype='band', output='sos')
+        else:
+            self._bp_sos = None
+
+    # ------------------------------------------------------------------
+    # Private helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _ar_coefficients(signal: np.ndarray, order: int = 4) -> np.ndarray:
+        """4th-order AR coefficients via Yule-Walker (autocorrelation method)."""
+        n = len(signal)
+        r = np.array([float(np.dot(signal[:n - k], signal[k:])) / n
+                      for k in range(order + 1)])
+        T = np.array([[r[abs(i - j)] for j in range(order)] for i in range(order)])
+        try:
+            return np.linalg.solve(T, r[1:order + 1])
+        except np.linalg.LinAlgError:
+            return np.zeros(order)
+
+    def _spectral_features(self, signal: np.ndarray) -> tuple:
+        """MNF, MDF, PKF, MNP, BP0-BP3 via rfft (zero-padded to fft_n)."""
+        spec   = np.abs(np.fft.rfft(signal, n=self.fft_n)) ** 2
+        freqs  = np.fft.rfftfreq(self.fft_n, d=1.0 / self.fs)
+        total  = float(np.sum(spec)) + 1e-10
+
+        mnf = float(np.dot(freqs, spec) / total)
+
+        cumsum  = np.cumsum(spec)
+        mid_idx = int(np.searchsorted(cumsum, total / 2.0))
+        mdf     = float(freqs[min(mid_idx, len(freqs) - 1)])
+
+        pkf = float(freqs[int(np.argmax(spec))])
+        mnp = float(total / len(spec))
+
+        def _bp(f_lo: float, f_hi: float) -> float:
+            mask = (freqs >= f_lo) & (freqs < f_hi)
+            return float(np.sum(spec[mask]) / total)
+
+        return mnf, mdf, pkf, mnp, _bp(20, 80), _bp(80, 150), _bp(150, 250), _bp(250, 450)
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
     def extract_features_single_channel(self, signal: np.ndarray) -> dict:
         """
-        Extract all features from a single channel signal.
+        Extract features from a single, already-selected channel.
 
-        Per-window centering is applied first to remove DC offset.
-        This is the standard approach for EMG feature extraction.
+        Returns a dict with 4 keys (legacy) or 20 keys (expanded).
+        Bandpass filter (if enabled) + per-window DC removal are applied first.
         """
-        # Per-window centering: remove DC offset (critical for ZC/SSC)
-        # This only uses data from the current window (causal for real-time)
-        signal = signal - np.mean(signal)
+        # Bandpass filter to match firmware IIR (20-450 Hz, 2nd-order Butterworth).
+        # Uses sosfilt (causal) with sosfilt_zi to initialise the filter state
+        # at the signal's DC level, avoiding large startup transients on the
+        # short 150-sample windows.
+        if self.bandpass and self._bp_sos is not None:
+            zi = sosfilt_zi(self._bp_sos) * signal[0]
+            signal, _ = sosfilt(self._bp_sos, signal, zi=zi)
 
-        # RMS - Root Mean Square (now measures AC power, not DC offset)
-        rms = np.sqrt(np.mean(signal ** 2))
+        signal = signal - np.mean(signal)  # DC removal
 
-        # WL - Waveform Length
-        wl = np.sum(np.abs(np.diff(signal)))
+        # Change 4 — Reinhard tone-mapping (compresses large spikes)
+        if self.reinhard:
+            signal = 64.0 * signal / (32.0 + np.abs(signal))
 
-        # Dynamic thresholds based on signal RMS
-        zc_thresh = self.zc_threshold_percent * rms
+        rms = float(np.sqrt(np.mean(signal ** 2)))
+        wl  = float(np.sum(np.abs(np.diff(signal))))
+
+        zc_thresh  = self.zc_threshold_percent * rms
         ssc_thresh = (self.ssc_threshold_percent * rms) ** 2
 
-        # ZC - Zero Crossings (with threshold to reject noise)
-        # Now meaningful because signal is centered around 0
-        sign_changes = signal[:-1] * signal[1:] < 0
-        amplitude_diff = np.abs(np.diff(signal)) > zc_thresh
-        zc = np.sum(sign_changes & amplitude_diff)
+        diffs = np.diff(signal)
+        sign_chg = signal[:-1] * signal[1:] < 0
+        zc  = int(np.sum(sign_chg & (np.abs(diffs) > zc_thresh)))
 
-        # SSC - Slope Sign Changes
-        diff_left = signal[1:-1] - signal[:-2]
-        diff_right = signal[1:-1] - signal[2:]
-        ssc = np.sum((diff_left * diff_right) > ssc_thresh)
+        dl = signal[1:-1] - signal[:-2]
+        dr = signal[1:-1] - signal[2:]
+        ssc = int(np.sum((dl * dr) > ssc_thresh))
 
-        return {'rms': rms, 'wl': wl, 'zc': zc, 'ssc': ssc}
+        feats: dict = {'rms': rms, 'wl': wl, 'zc': float(zc), 'ssc': float(ssc)}
+
+        if self.expanded:
+            mav  = float(np.mean(np.abs(signal)))
+            var  = float(np.var(signal))
+            iemg = float(np.sum(np.abs(signal)))
+            wamp = int(np.sum(np.abs(diffs) > zc_thresh))
+
+            ar = self._ar_coefficients(signal, order=4)
+            mnf, mdf, pkf, mnp, bp0, bp1, bp2, bp3 = self._spectral_features(signal)
+
+            feats.update({
+                'mav': mav, 'var': var, 'iemg': iemg, 'wamp': float(wamp),
+                'ar1': float(ar[0]), 'ar2': float(ar[1]),
+                'ar3': float(ar[2]), 'ar4': float(ar[3]),
+                'mnf': mnf, 'mdf': mdf, 'pkf': pkf, 'mnp': mnp,
+                'bp0': bp0, 'bp1': bp1, 'bp2': bp2, 'bp3': bp3,
+            })
+
+        return feats
 
     def extract_features_window(self, window: np.ndarray) -> np.ndarray:
         """
         Extract features from a window of shape (samples, channels).
 
-        Returns flat array: [ch0_rms, ch0_wl, ch0_zc, ch0_ssc, ch1_rms, ...]
+        Returns a flat float32 array ordered as:
+          [ch_i feats..., ch_j feats..., ..., cross-channel feats...]
         """
-        n_channels = window.shape[1]
-        features = []
+        channel_indices = self.channels if self.channels is not None \
+                          else list(range(window.shape[1]))
 
-        for ch in range(n_channels):
-            ch_features = self.extract_features_single_channel(window[:, ch])
-            features.extend([ch_features['rms'], ch_features['wl'],
-                           ch_features['zc'], ch_features['ssc']])
+        all_ch_feats = [self.extract_features_single_channel(window[:, ch])
+                        for ch in channel_indices]
 
-        return np.array(features)
+        norm_factor = 1.0
+        if self.normalize:
+            total_rms   = float(np.sqrt(sum(f['rms'] ** 2 for f in all_ch_feats)))
+            norm_factor = max(total_rms, 1e-6)
+
+        feat_keys = self._EXPANDED_KEYS if self.expanded else self._LEGACY_KEYS
+
+        features: list[float] = []
+        for ch_feats in all_ch_feats:
+            for key in feat_keys:
+                val = ch_feats[key]
+                if self.normalize and key in self._NORM_KEYS:
+                    val = val / norm_factor
+                features.append(val)
+
+        # Cross-channel features (expanded mode, ≥2 channels)
+        # Bug 6 fix: firmware computes cross-channel features from
+        # Reinhard-mapped signals when MODEL_USE_REINHARD=1.  Apply the
+        # same tone-mapping here so correlation/covariance match.
+        if self.expanded and self.cross_channel and len(channel_indices) >= 2:
+            centered = []
+            for ch in channel_indices:
+                sig = window[:, ch] - np.mean(window[:, ch])
+                # Apply bandpass if enabled (matches firmware pipeline order)
+                if self.bandpass and self._bp_sos is not None:
+                    zi = sosfilt_zi(self._bp_sos) * sig[0]
+                    sig, _ = sosfilt(self._bp_sos, sig, zi=zi)
+                if self.reinhard:
+                    sig = 64.0 * sig / (32.0 + np.abs(sig))
+                centered.append(sig)
+            rms_vals = [f['rms'] + 1e-10 for f in all_ch_feats]
+            n = window.shape[0]
+
+            for i in range(len(channel_indices)):
+                for j in range(i + 1, len(channel_indices)):
+                    si, sj = centered[i], centered[j]
+                    ri, rj = rms_vals[i], rms_vals[j]
+
+                    corr = float(np.clip(np.dot(si, sj) / (n * ri * rj), -1.0, 1.0))
+                    lrms = float(np.log(ri / rj))
+                    cov  = float(np.dot(si, sj) / n)
+                    if self.normalize:
+                        cov /= (norm_factor ** 2)
+
+                    features.extend([corr, lrms, cov])
+
+        return np.array(features, dtype=np.float32)
 
     def extract_features_batch(self, X: np.ndarray) -> np.ndarray:
         """
-        Extract features from batch of windows.
+        Extract features from a batch of windows.
 
         Args:
-            X: Shape (n_windows, n_samples, n_channels)
-
+            X: (n_windows, n_samples, n_channels)
         Returns:
-            Features array of shape (n_windows, n_features)
-            where n_features = n_channels * 4
+            (n_windows, n_features) float32 array.
         """
-        n_windows = X.shape[0]
-        n_channels = X.shape[2]
-        n_features = n_channels * 4  # 4 features per channel
+        # Vectorised bandpass: apply sosfiltfilt on all windows at once along
+        # the samples axis.  This is ~100x faster than per-window sosfilt calls
+        # (scipy's C loop vs Python loop).  We disable per-window bandpass in
+        # extract_features_single_channel during batch extraction.
+        if self.bandpass and self._bp_sos is not None:
+            X = sosfiltfilt(self._bp_sos, X, axis=1).astype(np.float32)
 
-        features = np.zeros((n_windows, n_features))
+        n_windows  = X.shape[0]
+        n_ch_total = X.shape[2]
+        n_features = self._n_features(n_ch_total)
+        features   = np.zeros((n_windows, n_features), dtype=np.float32)
 
-        for i in range(n_windows):
-            features[i] = self.extract_features_window(X[i])
+        # Temporarily disable per-window bandpass (already applied above)
+        saved_bp = self.bandpass
+        self.bandpass = False
+        try:
+            for i in range(n_windows):
+                features[i] = self.extract_features_window(X[i])
+        finally:
+            self.bandpass = saved_bp
 
         return features
 
-    def get_feature_names(self, n_channels: int) -> list[str]:
-        """Get human-readable feature names."""
-        names = []
-        for ch in range(n_channels):
-            names.extend([f'ch{ch}_rms', f'ch{ch}_wl', f'ch{ch}_zc', f'ch{ch}_ssc'])
+    def _n_features(self, n_total_channels: int) -> int:
+        """Total feature vector length for the current configuration."""
+        n_ch         = len(self.channels) if self.channels is not None else n_total_channels
+        per_ch       = len(self._EXPANDED_KEYS if self.expanded else self._LEGACY_KEYS)
+        n            = n_ch * per_ch
+        if self.expanded and self.cross_channel and n_ch >= 2:
+            n += 3 * (n_ch * (n_ch - 1) // 2)  # 3 features × C(n_ch,2) pairs
+        return n
+
+    def get_feature_names(self, n_channels: int = 0) -> list[str]:
+        """Human-readable feature names matching the extract_features_window layout."""
+        channel_indices = self.channels if self.channels is not None \
+                          else list(range(n_channels))
+
+        feat_keys = self._EXPANDED_KEYS if self.expanded else self._LEGACY_KEYS
+
+        names: list[str] = []
+        for ch in channel_indices:
+            for key in feat_keys:
+                names.append(f'ch{ch}_{key}')
+
+        if self.expanded and self.cross_channel and len(channel_indices) >= 2:
+            for i in range(len(channel_indices)):
+                for j in range(i + 1, len(channel_indices)):
+                    ci, cj = channel_indices[i], channel_indices[j]
+                    names.extend([
+                        f'cc_{ci}{cj}_corr',
+                        f'cc_{ci}{cj}_lrms',
+                        f'cc_{ci}{cj}_cov',
+                    ])
+
         return names
+
+
+# =============================================================================
+# Change 6 — MPF FEATURE EXTRACTOR (Python training only)
+# =============================================================================
+
+class MPFFeatureExtractor:
+    """
+    Simplified 3-channel MPF: CSD upper triangle per 6 frequency bands = 36 features.
+    Python training only. Omits matrix logarithm (not needed for 3 channels).
+    Source: Kaifosh et al. Nature 2025. doi:10.1038/s41586-025-09255-w
+    ESP32 approximation: use bp0-bp3 from EMGFeatureExtractor (Change 1).
+    """
+    BANDS = [(0, 62), (62, 125), (125, 187), (187, 250), (250, 375), (375, 500)]
+
+    def __init__(self, channels=None, log_diagonal=True):
+        self.channels = channels or HAND_CHANNELS
+        self.log_diag = log_diagonal
+        self.n_ch = len(self.channels)
+        self._r, self._c = np.triu_indices(self.n_ch)
+        self.n_features = len(self.BANDS) * len(self._r)
+
+    def extract_window(self, window):
+        sig   = window[:, self.channels].astype(np.float64)
+        N     = len(sig)
+        freqs = np.fft.rfftfreq(N, d=1.0 / SAMPLING_RATE_HZ)
+        Xf    = np.fft.rfft(sig, axis=0)
+        feats = []
+        for lo, hi in self.BANDS:
+            mask = (freqs >= lo) & (freqs < hi)
+            if not mask.any():
+                feats.extend([0.0] * len(self._r))
+                continue
+            CSD = (Xf[mask].conj().T @ Xf[mask]).real / N
+            if self.log_diag:
+                for k in range(self.n_ch):
+                    CSD[k, k] = np.log(max(CSD[k, k], 1e-10))
+            feats.extend(CSD[self._r, self._c].tolist())
+        return np.array(feats, dtype=np.float32)
+
+    def extract_batch(self, X):
+        out = np.zeros((len(X), self.n_features), dtype=np.float32)
+        for i in range(len(X)):
+            out[i] = self.extract_window(X[i])
+        return out
+
+
+# =============================================================================
+# CALIBRATION TRANSFORM (Per-session feature-space alignment)
+# =============================================================================
+
+class CalibrationTransform:
+    """
+    Corrects for electrode placement drift between sessions via Session Z-Score Normalization.
+
+    Training: each training session's features are independently z-scored
+    (subtract session mean, divide by session std) before LDA fitting.
+    This removes placement-dependent amplitude shifts, so the model learns
+    in a placement-invariant normalized feature space.
+
+    Calibration: collect a short clip of each gesture → compute global
+    mean (mu_calib) and std (sigma_calib) of those features → apply the
+    same z-score to every live window:
+
+        x_normalized = (x_live - mu_calib) / sigma_calib
+
+    This projects live features into the same normalized space that training
+    used, regardless of how electrode placement changed.
+
+    Workflow:
+      1. fit_from_training()    — called automatically in EMGClassifier.train().
+                                  Stores per-class training centroids (in normalized
+                                  space) for diagnostics.
+      2. fit_from_calibration() — called at session start after collecting
+                                  a short clip of each gesture.
+                                  Computes mu_calib / sigma_calib.
+      3. apply()                — called on every live feature vector.
+                                  Returns (features - mu_calib) / sigma_calib.
+    """
+
+    def __init__(self):
+        self.has_training_stats: bool = False
+        self.is_fitted: bool = False
+        self.class_means_train: dict = {}                # {label: ndarray} from training (normalized space)
+        self.class_means_calib: dict = {}                # {label: ndarray} from calibration (raw space)
+        # Stats for the z-score transform
+        self.mu_calib: Optional[np.ndarray] = None       # Class-balanced mean of calibration features (raw space)
+        self.sigma_calib: Optional[np.ndarray] = None    # Global std of calibration features (raw space)
+        self.sigma_train: Optional[np.ndarray] = None    # Mean per-session sigma from training (preferred scale ref)
+        # Energy gate for rest detection (bypasses LDA when signal is quiet)
+        self.rest_energy_threshold: Optional[float] = None
+
+    def fit_from_training(self, X_features: np.ndarray, y: np.ndarray, label_names: list):
+        """
+        Store per-class training centroids. Called automatically in EMGClassifier.train().
+
+        Args:
+            X_features:  (n_windows, n_features) extracted training features
+            y:           (n_windows,) integer label indices
+            label_names: label string list matching y indices
+        """
+        self.has_training_stats = True
+
+        self.class_means_train = {}
+        for i, name in enumerate(label_names):
+            mask = y == i
+            if mask.any():
+                self.class_means_train[name] = np.mean(X_features[mask], axis=0)
+
+    def fit_from_calibration(self, calib_features: np.ndarray, calib_labels: list):
+        """
+        Compute z-score normalization params from calibration-session data.
+
+        mu_calib    = class-balanced mean (average of per-class centroids)
+        sigma_calib = overall std of all calibration feature windows
+
+        Using the class-balanced mean prevents near-zero-amplitude classes (rest)
+        from landing at the wrong normalized position when training sessions had
+        unequal numbers of windows per class.
+
+        Args:
+            calib_features: (n_windows, n_features) from calibration clips
+            calib_labels:   gesture label per window
+        """
+        if not self.has_training_stats:
+            raise ValueError(
+                "Training stats not available. Load a model that was trained "
+                "after calibration support was added (retrain if needed)."
+            )
+
+        # Per-class calibration centroids (raw space)
+        self.class_means_calib = {}
+        label_arr = np.array(calib_labels)
+        for label in set(calib_labels):
+            mask = label_arr == label
+            if mask.any():
+                self.class_means_calib[label] = np.mean(calib_features[mask], axis=0)
+
+        # Class-balanced mean: average of per-class centroids (not overall mean).
+        # Prevents class-imbalanced calibration clips from biasing the normalization
+        # origin (especially important for rest, which has near-zero amplitude).
+        self.mu_calib = np.mean(list(self.class_means_calib.values()), axis=0)
+        self.sigma_calib = np.std(calib_features, axis=0) + 1e-8
+
+        # rest_energy_threshold is set externally from raw window RMS values
+        # (cannot be computed here — extracted features are amplitude-normalized).
+        self.rest_energy_threshold = None
+
+        self.is_fitted = True
+
+        # Decide which sigma to use for scaling:
+        #   sigma_train (preferred) — mean per-session sigma from training.
+        #     Ensures the classifier sees calibration features at the SAME scale
+        #     as training features, which is critical for QDA whose per-class
+        #     covariance ellipsoids are fixed in normalized training space.
+        #   sigma_calib (fallback) — std of this calibration session.
+        #     Used only if the model was trained without session normalization.
+        sigma_used = self.sigma_train if self.sigma_train is not None else self.sigma_calib
+        sigma_source = "sigma_train" if self.sigma_train is not None else "sigma_calib (fallback)"
+        print(f"[Calibration] Z-score fit: {len(calib_features)} windows, "
+              f"{len(self.class_means_calib)} classes  [scale ref: {sigma_source}]")
+        # Per-class residual in normalized space (lower = better alignment)
+        common = set(self.class_means_calib) & set(self.class_means_train)
+        for c in sorted(common):
+            norm_calib = (self.class_means_calib[c] - self.mu_calib) / self.sigma_calib
+            residual = np.linalg.norm(self.class_means_train[c] - norm_calib)
+            print(f"[Calibration]   {c}: normalized residual = {residual:.4f}")
+
+    def apply(self, features: np.ndarray) -> np.ndarray:
+        """
+        Z-score normalize features using calibration session statistics.
+
+        Uses sigma_train (mean per-session sigma from training) for scaling when
+        available — this keeps calibration features at the same scale as training
+        features, which is critical for QDA.  Falls back to sigma_calib for old
+        models trained without session normalization.
+
+        Args:
+            features: shape (n_features,) or (n_windows, n_features)
+        Returns:
+            (features - mu_calib) / sigma, same shape as input.
+            Pass-through if not fitted.
+        """
+        if not self.is_fitted:
+            return features
+        sigma = self.sigma_train if self.sigma_train is not None else self.sigma_calib
+        return (features - self.mu_calib) / sigma
+
+    def reset(self):
+        """Remove per-session calibration (keeps training centroids intact)."""
+        self.mu_calib = None
+        self.sigma_calib = None
+        self.rest_energy_threshold = None
+        self.is_fitted = False
+        self.class_means_calib = {}
+        # sigma_train is permanent (set at train time, not session-specific)
+
+
+# =============================================================================
+# DATA AUGMENTATION (Change 3)
+# =============================================================================
+
+def augment_emg_batch(
+    X: np.ndarray,
+    y: np.ndarray,
+    multiplier: int = 3,
+    seed: int = 42,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Augment raw EMG windows for training robustness.
+
+    Must be called on raw windows (n_windows, n_samples, n_channels),
+    not on pre-computed features.  Each copy independently applies:
+      - Amplitude scaling ×[0.80, 1.20]
+      - Gaussian noise 5 % of per-window RMS
+      - DC offset jitter ±20 counts
+      - Time-shift (roll) ±5 samples
+
+    Source: Kaifosh et al. Nature 2025. doi:10.1038/s41586-025-09255-w
+    """
+    rng = np.random.default_rng(seed)
+    aug_X, aug_y = [X], [y]
+    for _ in range(multiplier - 1):
+        Xc  = X.copy().astype(np.float32)
+        Xc *= rng.uniform(0.80, 1.20, (len(X), 1, 1)).astype(np.float32)
+        rms  = np.sqrt(np.mean(Xc ** 2, axis=(1, 2), keepdims=True)) + 1e-8
+        Xc  += rng.standard_normal(Xc.shape).astype(np.float32) * (0.05 * rms)
+        Xc  += rng.uniform(-20., 20., (len(X), 1, X.shape[2])).astype(np.float32)
+        shifts = rng.integers(-5, 6, size=len(X))
+        for i in range(len(Xc)):
+            if shifts[i]:
+                Xc[i] = np.roll(Xc[i], shifts[i], axis=0)
+        aug_X.append(Xc)
+        aug_y.append(y)
+    return np.concatenate(aug_X), np.concatenate(aug_y)
 
 
 # =============================================================================
@@ -1624,23 +2000,28 @@ class EMGFeatureExtractor:
 
 class EMGClassifier:
     """
-    LDA-based EMG gesture classifier.
+    EMG gesture classifier supporting LDA and QDA.
 
-    LESSON: Why LDA for EMG?
-      - Fast training and inference (good for embedded)
-      - Works well with small datasets
-      - Interpretable (can visualize decision boundaries)
-      - Proven effective for EMG in literature
+    Model types:
+      - LDA: Linear Discriminant Analysis — fast, exportable to ESP32 C header
+      - QDA: Quadratic Discriminant Analysis — more flexible boundaries, laptop-only
     """
 
-    def __init__(self):
-        self.feature_extractor = EMGFeatureExtractor()
-        self.lda = LinearDiscriminantAnalysis()
+    def __init__(self, model_type: str = "lda", reg_param: float = 0.1):
+        self.model_type = model_type.lower()
+        self.reg_param = reg_param  # only used by QDA
+        self.feature_extractor = EMGFeatureExtractor(channels=HAND_CHANNELS, reinhard=True)
+        if self.model_type == "qda":
+            self.model = QuadraticDiscriminantAnalysis(reg_param=reg_param)
+        else:
+            self.model = LinearDiscriminantAnalysis()
         self.label_names: list[str] = []
         self.is_trained = False
         self.feature_names: list[str] = []
+        self.calibration_transform = CalibrationTransform()
 
-    def train(self, X: np.ndarray, y: np.ndarray, label_names: list[str]):
+    def train(self, X: np.ndarray, y: np.ndarray, label_names: list[str],
+              session_indices: Optional[np.ndarray] = None):
         """
         Train the classifier.
 
@@ -1648,24 +2029,82 @@ class EMGClassifier:
             X: Raw EMG windows (n_windows, n_samples, n_channels)
             y: Integer labels (n_windows,)
             label_names: List of label strings
+            session_indices: Optional per-window integer session ID (0..n_sessions-1).
+                             When provided, each session's features are independently
+                             z-scored before fitting, creating a placement-invariant model.
         """
+        # Change 3: data augmentation on raw windows before feature extraction
+        if getattr(self, 'use_augmentation', True):
+            X_aug, y_aug = augment_emg_batch(X, y, multiplier=3)
+            print(f"[Classifier] Augmentation: {len(X)} -> {len(X_aug)} windows")
+            # Replicate session_indices to match the augmented size
+            if session_indices is not None:
+                session_indices = np.tile(session_indices, 3)
+        else:
+            X_aug, y_aug = X, y
+
         print("\n[Classifier] Extracting features...")
-        X_features = self.feature_extractor.extract_features_batch(X)
-        self.feature_names = self.feature_extractor.get_feature_names(X.shape[2])
+        X_features = self.feature_extractor.extract_features_batch(X_aug)
+        self.feature_names = self.feature_extractor.get_feature_names(X_aug.shape[2])
+
+        # Change 6: optionally stack MPF features
+        if getattr(self, 'use_mpf', False):
+            mpf = MPFFeatureExtractor(channels=HAND_CHANNELS)
+            X_features = np.hstack([X_features, mpf.extract_batch(X_aug)])
 
         print(f"[Classifier] Feature matrix shape: {X_features.shape}")
         print(f"[Classifier] Features per window: {len(self.feature_names)}")
 
-        print("\n[Classifier] Training LDA...")
-        self.lda.fit(X_features, y)
+        if session_indices is not None:
+            n_sessions = len(np.unique(session_indices))
+            print(f"\n[Classifier] Applying per-session z-score normalization ({n_sessions} sessions, class-balanced mu)...")
+            X_features = self._apply_session_normalization(X_features, session_indices, y=y_aug)
+
+        print(f"\n[Classifier] Training {self.model_type.upper()}...")
+        self.model.fit(X_features, y_aug)
         self.label_names = label_names
         self.is_trained = True
 
+        # Store training distribution (in normalized space) for calibration diagnostics
+        self.calibration_transform.fit_from_training(X_features, y_aug, label_names)
+
         # Training accuracy
-        train_acc = self.lda.score(X_features, y)
+        train_acc = self.model.score(X_features, y_aug)
         print(f"[Classifier] Training accuracy: {train_acc*100:.1f}%")
 
         return X_features
+
+    def _apply_session_normalization(self, X_features: np.ndarray, session_indices: np.ndarray,
+                                     y: Optional[np.ndarray] = None) -> np.ndarray:
+        """
+        Z-score each session's features independently using a class-balanced mean.
+
+        For each session:
+          - mu    = mean of per-class centroids (class-balanced, not weighted by window count)
+          - sigma = overall std of all windows in the session
+
+        Using the class-balanced mean prevents sessions with more rest windows (or any
+        imbalanced class) from skewing the normalization origin toward that class.
+        """
+        X_norm = X_features.copy()
+        session_sigmas = []
+        for sid in np.unique(session_indices):
+            mask = session_indices == sid
+            X_sess = X_features[mask]
+            if y is not None:
+                # Class-balanced mean: average of per-class centroids
+                y_sess = y[mask]
+                class_means = [X_sess[y_sess == cls].mean(axis=0)
+                               for cls in np.unique(y_sess)]
+                mu = np.mean(class_means, axis=0)
+            else:
+                mu = X_sess.mean(axis=0)
+            sigma = X_sess.std(axis=0) + 1e-8
+            session_sigmas.append(sigma)
+            X_norm[mask] = (X_sess - mu) / sigma
+        # Store mean per-session sigma so calibration can use the same scale reference
+        self.calibration_transform.sigma_train = np.mean(session_sigmas, axis=0)
+        return X_norm
 
     def evaluate(self, X: np.ndarray, y: np.ndarray) -> dict:
         """Evaluate classifier on test data."""
@@ -1673,7 +2112,7 @@ class EMGClassifier:
             raise ValueError("Classifier not trained!")
 
         X_features = self.feature_extractor.extract_features_batch(X)
-        y_pred = self.lda.predict(X_features)
+        y_pred = self.model.predict(X_features)
 
         accuracy = np.mean(y_pred == y)
 
@@ -1683,11 +2122,30 @@ class EMGClassifier:
             'y_true': y
         }
 
-    def cross_validate(self, X: np.ndarray, y: np.ndarray, cv: int = 5) -> np.ndarray:
-        """Perform k-fold cross-validation."""
-        print(f"\n[Classifier] Running {cv}-fold cross-validation...")
+    def cross_validate(self, X: np.ndarray, y: np.ndarray, trial_ids: Optional[np.ndarray] = None,
+                       cv: int = 5, session_indices: Optional[np.ndarray] = None) -> np.ndarray:
+        """
+        Perform k-fold cross-validation with trial-level splitting.
+
+        When trial_ids are provided, uses GroupKFold to ensure windows from the
+        same trial never appear in both train and test folds (prevents leakage).
+
+        When session_indices are provided, applies the same per-session z-score
+        normalization used during training before running CV.
+        """
         X_features = self.feature_extractor.extract_features_batch(X)
-        scores = cross_val_score(self.lda, X_features, y, cv=cv)
+
+        if session_indices is not None:
+            X_features = self._apply_session_normalization(X_features, session_indices, y=y)
+
+        if trial_ids is not None:
+            print(f"\n[Classifier] Running {cv}-fold cross-validation (TRIAL-LEVEL, no leakage)...")
+            group_kfold = GroupKFold(n_splits=cv)
+            scores = cross_val_score(self.model, X_features, y, cv=group_kfold, groups=trial_ids)
+        else:
+            print(f"\n[Classifier] Running {cv}-fold cross-validation (window-level, legacy)...")
+            scores = cross_val_score(self.model, X_features, y, cv=cv)
+
         return scores
 
     def predict(self, window: np.ndarray) -> tuple[str, np.ndarray]:
@@ -1703,19 +2161,52 @@ class EMGClassifier:
         if not self.is_trained:
             raise ValueError("Classifier not trained!")
 
-        features = self.feature_extractor.extract_features_window(window)
-        pred_idx = self.lda.predict([features])[0]
-        proba = self.lda.predict_proba([features])[0]
+        if not hasattr(self, '_predict_count'):
+            self._predict_count = 0
+        self._predict_count += 1
+        _debug = (self._predict_count <= 30)
 
+        features_raw = self.feature_extractor.extract_features_window(window)
+
+        # Energy gate: if raw signal is quiet enough to be rest, skip LDA entirely.
+        # Uses raw window RMS (pre-feature-extraction) so amplitude normalization
+        # inside the feature extractor doesn't mask the energy difference.
+        ct = self.calibration_transform
+        if (ct.is_fitted and ct.rest_energy_threshold is not None
+                and "rest" in self.label_names):
+            w_ac = window - window.mean(axis=0)   # remove per-window DC offset (matches feature extractor)
+            raw_rms = float(np.sqrt(np.mean(w_ac ** 2)))
+            if _debug:
+                print(f"[predict #{self._predict_count}] rms={raw_rms:.1f}  gate={ct.rest_energy_threshold:.1f}  "
+                      f"{'GATED->rest' if raw_rms < ct.rest_energy_threshold else 'pass->QDA/LDA'}")
+            if raw_rms < ct.rest_energy_threshold:
+                rest_idx = self.label_names.index("rest")
+                proba = np.zeros(len(self.label_names))
+                proba[rest_idx] = 1.0
+                return "rest", proba
+        elif _debug:
+            print(f"[predict #{self._predict_count}] gate inactive (is_fitted={ct.is_fitted}, "
+                  f"threshold={ct.rest_energy_threshold})")
+
+        features = ct.apply(features_raw)
+        pred_idx = self.model.predict([features])[0]
+        proba = self.model.predict_proba([features])[0]
+        if _debug:
+            top = sorted(zip(self.label_names, proba), key=lambda x: -x[1])[:3]
+            print(f"[predict #{self._predict_count}] {self.model_type.upper()} -> {self.label_names[pred_idx]}"
+                  f"  proba: {', '.join(f'{n}={p:.2f}' for n,p in top)}")
         return self.label_names[pred_idx], proba
 
     def get_feature_importance(self) -> dict:
-        """Get feature importance based on LDA coefficients."""
+        """Get feature importance based on LDA coefficients (LDA only)."""
         if not self.is_trained:
             return {}
 
+        if not hasattr(self.model, 'coef_'):
+            return {}
+
         # For multi-class, average absolute coefficients across classes
-        coef = np.abs(self.lda.coef_).mean(axis=0)
+        coef = np.abs(self.model.coef_).mean(axis=0)
         importance = dict(zip(self.feature_names, coef))
         return dict(sorted(importance.items(), key=lambda x: x[1], reverse=True))
 
@@ -1742,14 +2233,28 @@ class EMGClassifier:
         filepath.parent.mkdir(parents=True, exist_ok=True)
 
         model_data = {
-            'lda': self.lda,
+            'model': self.model,
+            'model_type': self.model_type,
             'label_names': self.label_names,
             'feature_names': self.feature_names,
             'feature_extractor_params': {
                 'zc_threshold_percent': self.feature_extractor.zc_threshold_percent,
                 'ssc_threshold_percent': self.feature_extractor.ssc_threshold_percent,
+                'channels': self.feature_extractor.channels,
+                'normalize': self.feature_extractor.normalize,
+                'expanded': self.feature_extractor.expanded,
+                'cross_channel': self.feature_extractor.cross_channel,
+                'bandpass': self.feature_extractor.bandpass,
+                'reinhard': self.feature_extractor.reinhard,
+                'fft_n': self.feature_extractor.fft_n,
+                'fs': self.feature_extractor.fs,
             },
-            'version': '1.0',  # For future compatibility
+            'version': '1.3',
+            'reg_param': self.reg_param,
+            'session_normalized': True,
+            # Calibration transform training stats (used by CalibrationPage)
+            'calib_class_means_train': self.calibration_transform.class_means_train,
+            'calib_sigma_train': self.calibration_transform.sigma_train,
         }
 
         joblib.dump(model_data, filepath)
@@ -1770,6 +2275,12 @@ class EMGClassifier:
         if not self.is_trained:
             raise ValueError("Cannot export untrained classifier!")
 
+        if self.model_type != "lda":
+            raise ValueError(
+                f"Cannot export {self.model_type.upper()} to C header. "
+                "Only LDA models can be exported (QDA lacks coef_/intercept_)."
+            )
+
         filepath = Path(filepath)
         filepath.parent.mkdir(parents=True, exist_ok=True)
 
@@ -1779,8 +2290,8 @@ class EMGClassifier:
         # Get LDA parameters
         # coef_: (n_classes, n_features) - access as [class][feature]
         # intercept_: (n_classes,)
-        coefs = self.lda.coef_
-        intercepts = self.lda.intercept_
+        coefs = self.model.coef_
+        intercepts = self.model.intercept_
 
         # Add logic for binary classification (sklearn stores only 1 set of coefs)
         # For >2 classes, it stores n_classes sets.
@@ -1815,9 +2326,27 @@ class EMGClassifier:
                 # Safest: Let's trust that for our 5-gesture demo, it's multiclass.
                 pass
 
+        # Bug 7 fix: preserve compile-time flags that are independent of
+        # the feature pipeline (MLP, ensemble).  Pipeline-dependent flags
+        # (EXPAND_FEATURES, REINHARD) are set from the extractor config so
+        # they always match the exported weights.
+        preserved_flags = {}
+        _PRESERVED_FLAG_NAMES = ['MODEL_USE_MLP', 'MODEL_USE_ENSEMBLE']
+        if filepath.exists():
+            import re
+            existing = filepath.read_text()
+            for flag in _PRESERVED_FLAG_NAMES:
+                m = re.search(rf'#define\s+{flag}\s+(\d+)', existing)
+                if m:
+                    preserved_flags[flag] = int(m.group(1))
+
+        # Auto-set pipeline flags from training config (prevents mismatch)
+        preserved_flags['MODEL_EXPAND_FEATURES'] = 1 if self.feature_extractor.expanded else 0
+        preserved_flags['MODEL_USE_REINHARD'] = 1 if self.feature_extractor.reinhard else 0
+
         # Generate C content
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        
+
         c_content = [
             "/**",
             f" * @file {filepath.name}",
@@ -1833,10 +2362,23 @@ class EMGClassifier:
             "/* Metadata */",
             f"#define MODEL_NUM_CLASSES {n_classes}",
             f"#define MODEL_NUM_FEATURES {n_features}",
+            f"#define MODEL_NORMALIZE_FEATURES {1 if self.feature_extractor.normalize else 0}",
             "",
-            "/* Class Names */",
-            "static const char* MODEL_CLASS_NAMES[MODEL_NUM_CLASSES] = {",
         ]
+
+        # Write compile-time flags (pipeline flags auto-set, architecture flags preserved)
+        _ALL_FLAGS = [
+            'MODEL_EXPAND_FEATURES', 'MODEL_USE_REINHARD',
+            'MODEL_USE_MLP', 'MODEL_USE_ENSEMBLE',
+        ]
+        c_content.append("/* Compile-time feature flags */")
+        for flag in _ALL_FLAGS:
+            val = preserved_flags.get(flag, 0)
+            c_content.append(f"#define {flag} {val}")
+        c_content.append("")
+
+        c_content.append("/* Class Names */")
+        c_content.append("static const char* MODEL_CLASS_NAMES[MODEL_NUM_CLASSES] = {")
 
         for name in self.label_names:
             c_content.append(f'    "{name}",')
@@ -1900,22 +2442,61 @@ class EMGClassifier:
 
         model_data = joblib.load(filepath)
 
+        # Determine model type (backward compat: old files have 'lda' key, no 'model_type')
+        model_type = model_data.get('model_type', 'lda')
+        reg_param  = model_data.get('reg_param', 0.1)
+
         # Create new instance and restore state
-        classifier = cls()
-        classifier.lda = model_data['lda']
+        classifier = cls(model_type=model_type, reg_param=reg_param)
+        classifier.model = model_data.get('model', model_data.get('lda'))
         classifier.label_names = model_data['label_names']
-        classifier.feature_names = model_data['feature_names']
         classifier.is_trained = True
 
         # Restore feature extractor params
         params = model_data.get('feature_extractor_params', {})
+        # Infer expanded/cross_channel from feature count for old models
+        # that don't store these params: 12 features = legacy (4×3),
+        # 69 features = expanded (20×3 + 9 cross-channel)
+        saved_feat_names = model_data.get('feature_names', [])
+        n_feat = len(saved_feat_names) if saved_feat_names else 69
+        default_expanded = n_feat > 12
+        default_cc = n_feat > 60  # cross-channel adds 9 features (60→69)
         classifier.feature_extractor = EMGFeatureExtractor(
             zc_threshold_percent=params.get('zc_threshold_percent', 0.1),
             ssc_threshold_percent=params.get('ssc_threshold_percent', 0.1),
+            channels=params.get('channels', HAND_CHANNELS),
+            normalize=params.get('normalize', False),
+            expanded=params.get('expanded', default_expanded),
+            cross_channel=params.get('cross_channel', default_cc),
+            bandpass=params.get('bandpass', False),  # False for old models
+            reinhard=params.get('reinhard', False),
+            fft_n=params.get('fft_n', 256),
+            fs=params.get('fs', float(SAMPLING_RATE_HZ)),
         )
+        # Regenerate feature names from extractor if not in saved data
+        if saved_feat_names:
+            classifier.feature_names = saved_feat_names
+        else:
+            channels = params.get('channels', HAND_CHANNELS)
+            classifier.feature_names = classifier.feature_extractor.get_feature_names(len(channels))
+
+        # Restore calibration transform training stats (saved from v1.2+ models)
+        classifier.calibration_transform = CalibrationTransform()
+        class_means_train = model_data.get('calib_class_means_train', {})
+        sigma_train       = model_data.get('calib_sigma_train')
+        session_normalized = model_data.get('session_normalized', False)
+        classifier.session_normalized = session_normalized
+        if class_means_train:
+            classifier.calibration_transform.class_means_train = class_means_train
+            classifier.calibration_transform.has_training_stats = True
+        if sigma_train is not None:
+            classifier.calibration_transform.sigma_train = sigma_train
 
         print(f"[Classifier] Model loaded from: {filepath}")
         print(f"[Classifier] Labels: {classifier.label_names}")
+        calib_ready = classifier.calibration_transform.has_training_stats
+        print(f"[Classifier] Calibration support: {'yes' if calib_ready else 'no (retrain to enable)'}")
+        print(f"[Classifier] Session-normalized: {session_normalized}")
         return classifier
 
     @staticmethod
@@ -1924,10 +2505,21 @@ class EMGClassifier:
         return MODEL_DIR / "emg_lda_classifier.joblib"
 
     @staticmethod
+    def get_latest_model_path() -> Path | None:
+        """Get the most recently modified model file, or None if no models exist."""
+        models = EMGClassifier.list_saved_models()
+        if not models:
+            return None
+        return max(models, key=lambda p: p.stat().st_mtime)
+
+    @staticmethod
     def list_saved_models() -> list[Path]:
-        """List all saved model files."""
+        """List all saved classifier model files (excludes ensemble/auxiliary files)."""
         MODEL_DIR.mkdir(parents=True, exist_ok=True)
-        return sorted(MODEL_DIR.glob("*.joblib"))
+        return sorted(
+            p for p in MODEL_DIR.glob("*.joblib")
+            if "ensemble" not in p.stem
+        )
 
 
 # =============================================================================
@@ -2147,13 +2739,14 @@ def run_training_demo():
     print("TRAINING ON ALL SESSIONS COMBINED")
     print("=" * 60)
 
-    X, y, label_names, loaded_sessions = storage.load_all_for_training()
+    X, y, trial_ids, session_indices, label_names, loaded_sessions = storage.load_all_for_training()
 
     print(f"\nDataset:")
     print(f"  Windows: {X.shape[0]}")
     print(f"  Samples per window: {X.shape[1]}")
     print(f"  Channels: {X.shape[2]}")
     print(f"  Classes: {label_names}")
+    print(f"  Unique trials: {len(np.unique(trial_ids))}")
 
     # Count per class
     print(f"\nSamples per class:")
@@ -2165,8 +2758,8 @@ def run_training_demo():
     classifier = EMGClassifier()
     X_features = classifier.train(X, y, label_names)
 
-    # Cross-validation
-    cv_scores = classifier.cross_validate(X, y, cv=5)
+    # Cross-validation (trial-level to prevent leakage)
+    cv_scores = classifier.cross_validate(X, y, trial_ids=trial_ids, cv=5)
     print(f"\nCross-validation scores: {cv_scores}")
     print(f"Mean CV accuracy: {cv_scores.mean()*100:.1f}% (+/- {cv_scores.std()*100:.1f}%)")
 
@@ -2179,14 +2772,35 @@ def run_training_demo():
         bar = "█" * int(score * 20)
         print(f"  {name:12s}: {bar} ({score:.3f})")
 
-    # Train/test split evaluation
+    # Train/test split evaluation (TRIAL-LEVEL to prevent leakage)
     print(f"\n{'-' * 40}")
-    print("TRAIN/TEST SPLIT EVALUATION")
+    print("TRAIN/TEST SPLIT EVALUATION (TRIAL-LEVEL)")
     print("-" * 40)
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=y
-    )
+    # Use GroupShuffleSplit to split by trial, not by window
+    gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
+    train_idx, test_idx = next(gss.split(X, y, groups=trial_ids))
+
+    X_train, X_test = X[train_idx], X[test_idx]
+    y_train, y_test = y[train_idx], y[test_idx]
+    train_trial_ids = trial_ids[train_idx]
+    test_trial_ids = trial_ids[test_idx]
+
+    # VERIFICATION: Ensure no trial leakage
+    train_trials_set = set(train_trial_ids)
+    test_trials_set = set(test_trial_ids)
+    overlap = train_trials_set & test_trials_set
+    assert len(overlap) == 0, f"Trial leakage detected! Overlapping trials: {overlap}"
+    print(f"  Train: {len(X_train)} windows from {len(train_trials_set)} trials")
+    print(f"  Test:  {len(X_test)} windows from {len(test_trials_set)} trials")
+    print(f"  Trial overlap: {len(overlap)} (VERIFIED: no leakage)")
+
+    # Log per-class distribution
+    print(f"\n  Per-class window counts:")
+    for i, name in enumerate(label_names):
+        train_count = np.sum(y_train == i)
+        test_count = np.sum(y_test == i)
+        print(f"    {name:12s}: train={train_count:4d}, test={test_count:4d}")
 
     # Train on train set
     test_classifier = EMGClassifier()
@@ -2229,21 +2843,83 @@ def run_training_demo():
 
 
 # =============================================================================
+# Change 5 — CLASSIFIER BENCHMARK
+# =============================================================================
+
+def run_classifier_benchmark():
+    """
+    Cross-validate LDA, QDA, SVM-RBF, and MLP on the collected dataset.
+
+    Purpose: tells you whether accuracy plateau is a features problem
+    (all classifiers similar → add features) or a model complexity problem
+    (SVM/MLP >> LDA → implement Change E / ensemble).
+    """
+    from sklearn.svm import SVC
+    from sklearn.neural_network import MLPClassifier
+    from sklearn.pipeline import Pipeline
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.model_selection import cross_val_score, GroupKFold
+    from sklearn.discriminant_analysis import (LinearDiscriminantAnalysis,
+                                               QuadraticDiscriminantAnalysis)
+
+    print("\n" + "=" * 60)
+    print("CLASSIFIER BENCHMARK (Cross-validation)")
+    print("=" * 60)
+
+    storage = SessionStorage()
+    X_raw, y, trial_ids, session_indices, label_names, _ = storage.load_all_for_training()
+
+    if len(np.unique(y)) < 2:
+        print("Need at least 2 gesture classes. Collect more data first.")
+        return
+
+    extractor = EMGFeatureExtractor(channels=HAND_CHANNELS, cross_channel=True)
+    X = extractor.extract_features_batch(X_raw)
+    X = EMGClassifier()._apply_session_normalization(X, session_indices, y=y)
+
+    clfs = {
+        'LDA (ESP32 model)': LinearDiscriminantAnalysis(),
+        'QDA':               QuadraticDiscriminantAnalysis(reg_param=0.1),
+        'SVM-RBF':           Pipeline([('s', StandardScaler()),
+                                       ('m', SVC(kernel='rbf', C=10))]),
+        'MLP-128-64':        Pipeline([('s', StandardScaler()),
+                                       ('m', MLPClassifier(hidden_layer_sizes=(128, 64),
+                                                           max_iter=1000,
+                                                           early_stopping=True))]),
+    }
+
+    n_splits = min(5, len(np.unique(trial_ids)))
+    gkf = GroupKFold(n_splits=n_splits)
+
+    print(f"\n{'Classifier':<22} {'Mean CV':>8} {'Std':>6}")
+    print("-" * 40)
+    for name, clf in clfs.items():
+        sc = cross_val_score(clf, X, y, cv=gkf, groups=trial_ids, scoring='accuracy')
+        print(f"  {name:<20} {sc.mean()*100:>7.1f}%  ±{sc.std()*100:.1f}%")
+
+    print()
+    print("  → If LDA ≈ SVM: features are the bottleneck (add Change 1 features)")
+    print("  → If SVM >> LDA: model complexity bottleneck (implement Change F ensemble)")
+
+
+# =============================================================================
 # LIVE PREDICTION (Real-time gesture classification)
 # =============================================================================
 
 def run_prediction_demo():
     """
-    Live prediction demo - classifies gestures in real-time.
+    Live prediction demo - classifies gestures in real-time from ESP32.
 
     Shows:
       1. Load saved model OR train fresh on all sessions
-      2. Stream simulated EMG data
+      2. Connect to ESP32 and stream real EMG data
       3. Classify each window as it comes in
       4. Display predictions with confidence
+
+    REQUIRES: ESP32 hardware connected via USB.
     """
     print("\n" + "=" * 60)
-    print("LIVE PREDICTION DEMO")
+    print("LIVE PREDICTION DEMO (ESP32 Required)")
     print("=" * 60)
 
     # Check for saved model
@@ -2290,23 +2966,33 @@ def run_prediction_demo():
 
         # Load ALL sessions and train model
         print(f"\n[Training model on all sessions...]")
-        X, y, label_names, loaded_sessions = storage.load_all_for_training()
+        X, y, trial_ids, session_indices, label_names, loaded_sessions = storage.load_all_for_training()
+        print(f"[Unique trials: {len(np.unique(trial_ids))}]")
 
         classifier = EMGClassifier()
         classifier.train(X, y, label_names)
+
+    # Connect to ESP32
+    print("\n[Connecting to ESP32...]")
+    stream = RealSerialStream()
+    try:
+        stream.connect(timeout=5.0)
+        print(f"  Connected: {stream.device_info}")
+    except Exception as e:
+        print(f"  ERROR: Failed to connect to ESP32: {e}")
+        print("  Make sure the ESP32 is connected and firmware is flashed.")
+        return None
 
     # Start live prediction
     print("\n" + "=" * 60)
     print("STARTING LIVE PREDICTION (WITH SMOOTHING)")
     print("=" * 60)
 
-    max_predictions = 50  # Stop after this many predictions
-    print(f"Running {max_predictions} predictions with smoothing enabled...\n")
+    print("Press Ctrl+C to stop.\n")
     print("  Smoothing: Probability EMA (0.7) + Majority Vote (5) + Debounce (3)\n")
 
-    stream = GestureAwareEMGStream(num_channels=NUM_CHANNELS, sample_rate=SAMPLING_RATE_HZ)
     parser = EMGParser(num_channels=NUM_CHANNELS)
-    windower = Windower(window_size_ms=WINDOW_SIZE_MS, sample_rate=SAMPLING_RATE_HZ, overlap=0.0)
+    windower = Windower(window_size_ms=WINDOW_SIZE_MS, sample_rate=SAMPLING_RATE_HZ, hop_size_ms=HOP_SIZE_MS)
 
     # Create prediction smoother
     smoother = PredictionSmoother(
@@ -2316,29 +3002,11 @@ def run_prediction_demo():
         debounce_count=3,            # Consecutive predictions needed to change
     )
 
-    # Cycle through gestures for demo (names match ESP32 gesture definitions)
-    gesture_cycle = ["rest", "open", "fist", "hook_em", "thumbs_up"]
-    gesture_idx = 0
-    gesture_duration = 2.5  # seconds per gesture
-    gesture_start = time.perf_counter()
-    current_gesture = gesture_cycle[0]
-    stream.set_gesture(current_gesture)
-    print(f"  [Simulating: {current_gesture.upper()}]")
-
     stream.start()
     prediction_count = 0
 
     try:
-        while prediction_count < max_predictions:
-            # Change simulated gesture periodically
-            elapsed = time.perf_counter() - gesture_start
-            if elapsed > gesture_duration:
-                gesture_idx = (gesture_idx + 1) % len(gesture_cycle)
-                gesture_start = time.perf_counter()
-                current_gesture = gesture_cycle[gesture_idx]
-                stream.set_gesture(current_gesture)
-                print(f"\n  [Simulating: {current_gesture.upper()}]")
-
+        while True:
             # Read and process data
             line = stream.readline()
             if line:
@@ -2372,6 +3040,7 @@ def run_prediction_demo():
 
     finally:
         stream.stop()
+        stream.disconnect()
 
     # Show smoothing stats
     stats = smoother.get_stats()
@@ -2381,7 +3050,6 @@ def run_prediction_demo():
     print(f"  Total predictions: {stats['total_predictions']}")
     print(f"  Output changes: {stats['output_changes']}")
     print(f"  Stability ratio: {stats['stability_ratio']*100:.1f}%")
-    print(f"\n  (Without smoothing, output would change with every raw prediction)")
 
     return classifier
 
@@ -2430,10 +3098,11 @@ def run_visualization_demo():
         return None
 
     # Load ALL data combined
-    X, y, label_names, loaded_sessions = storage.load_all_for_training()
+    X, y, trial_ids, session_indices, label_names, loaded_sessions = storage.load_all_for_training()
+    print(f"[Unique trials: {len(np.unique(trial_ids))}]")
 
-    # Extract features
-    extractor = EMGFeatureExtractor()
+    # Extract features (forearm channels only, matching hand classifier)
+    extractor = EMGFeatureExtractor(channels=HAND_CHANNELS)
     X_features = extractor.extract_features_batch(X)
 
     # Train LDA
@@ -2563,8 +3232,6 @@ def run_visualization_demo():
     plt.tight_layout()
 
     # --- Figure 5: Confusion Matrix Heatmap ---
-    from sklearn.model_selection import cross_val_predict
-
     fig5, ax5 = plt.subplots(figsize=(8, 6))
 
     y_pred = cross_val_predict(lda, X_features, y, cv=5)
@@ -2614,6 +3281,7 @@ if __name__ == "__main__":
         print("  3. Train LDA classifier")
         print("  4. Live prediction demo")
         print("  5. Visualize LDA model")
+        print("  6. Classifier benchmark (LDA vs QDA vs SVM vs MLP)")
         print("  q. Quit")
 
         choice = input("\nEnter choice: ").strip().lower()
@@ -2637,5 +3305,8 @@ if __name__ == "__main__":
         elif choice == "5":
             lda = run_visualization_demo()
 
+        elif choice == "6":
+            run_classifier_benchmark()
+
         else:
-            print("\nInvalid choice. Please enter 1-5 or q.")
+            print("\nInvalid choice. Please enter 1-6 or q.")

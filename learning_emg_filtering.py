@@ -1,13 +1,42 @@
+"""
+EMG Signal Analysis Script (STANDALONE - NOT PRODUCTION CODE)
+==============================================================
+
+!! WARNING !!
+This script is for OFFLINE ANALYSIS AND VISUALIZATION ONLY.
+It is NOT part of the training or inference pipeline.
+
+DO NOT use this script's outputs for:
+- Model training
+- Feature extraction thresholds
+- Production inference
+
+The thresholds defined here (ZC_THRESHOLD_PERCENT, SSC_THRESHOLD_PERCENT)
+are DIFFERENT from production values in:
+- learning_data_collection.py (production: 0.1, 0.1)
+- model_weights.h (production: 0.1, 0.1)
+
+This script uses higher thresholds (0.7, 0.6) for visualization clarity,
+which would produce INCORRECT features if used for training/inference.
+
+To analyze collected sessions:
+1. Update HDF5_PATH to your session file
+2. Run: python learning_emg_filtering.py
+3. View the generated plots
+"""
+
 import numpy as np
 import matplotlib.pyplot as plt
 import h5py
 from scipy.signal import butter, sosfiltfilt
 
 # =============================================================================
-# CONFIGURABLE PARAMETERS
+# CONFIGURABLE PARAMETERS (FOR VISUALIZATION ONLY - NOT PRODUCTION VALUES!)
 # =============================================================================
-ZC_THRESHOLD_PERCENT = 0.7  # Zero Crossing threshold as fraction of RMS
-SSC_THRESHOLD_PERCENT = 0.6  # Slope Sign Change threshold as fraction of RMS
+# These thresholds are intentionally different from production (0.1, 0.1)
+# to provide cleaner visualizations. DO NOT use for training/inference.
+ZC_THRESHOLD_PERCENT = 0.7  # Zero Crossing threshold (VISUALIZATION ONLY)
+SSC_THRESHOLD_PERCENT = 0.6  # Slope Sign Change threshold (VISUALIZATION ONLY)
 
 # =============================================================================
 # LOAD DATA FROM GUI's HDF5 FORMAT

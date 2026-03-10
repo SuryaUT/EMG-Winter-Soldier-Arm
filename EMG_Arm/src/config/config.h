@@ -13,19 +13,12 @@
 #include "driver/ledc.h"
 
 /*******************************************************************************
- * Feature Flags
- *
- * Compile-time switches to enable/disable features.
- * Set to 1 to enable, 0 to disable.
+ * Main Modes
  ******************************************************************************/
 
-/**
- * @brief Use fake EMG data (random values) instead of real ADC reads.
- *
- * Set to 1 while waiting for EMG sensors to arrive.
- * Set to 0 when ready to use real sensors.
- */
-#define FEATURE_FAKE_EMG          0
+enum {EMG_MAIN, SERVO_CALIBRATOR, GESTURE_TESTER, EMG_STANDALONE};
+
+#define MAIN_MODE EMG_MAIN
 
 /*******************************************************************************
  * GPIO Pin Definitions - Servos
@@ -94,16 +87,5 @@ typedef enum {
     GESTURE_THUMBS_UP,
     GESTURE_COUNT
 } gesture_t;
-
-/**
- * @brief System operating modes.
- */
-typedef enum {
-    MODE_IDLE = 0,      /**< Waiting for commands */
-    MODE_DATA_STREAM,   /**< Streaming EMG data to laptop */
-    MODE_COMMAND,       /**< Executing gesture commands from laptop */
-    MODE_DEMO,          /**< Running demo sequence */
-    MODE_COUNT
-} system_mode_t;
 
 #endif /* CONFIG_H */
