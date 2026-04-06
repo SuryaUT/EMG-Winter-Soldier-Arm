@@ -1,9 +1,26 @@
 # EMG Winter Soldier Arm
 
+> **Status:** On-device gesture classification is working. Currently integrating servo control with live predictions to close the loop.
+
 A 3D-printed robotic hand controlled by EMG (electromyography) signals from your forearm. Flex your muscles, and the hand moves. The system runs real-time gesture classification entirely on-device using an ESP32-S3, with no laptop required during inference.
 
 <!-- TODO: Add a photo of the arm here -->
 <!-- ![EMG Winter Soldier Arm](assets/arm_photo.jpg) -->
+
+### Roadmap
+
+- [x] EMG signal acquisition and filtering (4-channel, 1 kHz DMA)
+- [x] Feature extraction pipeline (69 features)
+- [x] Python training GUI with data collection, visualization, and model export
+- [x] LDA classifier deployed on ESP32
+- [x] 3-specialist ensemble deployed on ESP32
+- [x] Int8 MLP deployed via TFLite Micro on ESP32
+- [x] Multi-model voting with EMA smoothing and debounce
+- [x] BLE command interface
+- [x] Z-score calibration with NVS persistence
+- [x] Servo driver and gesture execution
+- [ ] Connect prediction output to servo control (final integration)
+- [ ] End-to-end demo: flex forearm, hand moves
 
 ## How It Works
 
@@ -187,3 +204,5 @@ requirements.txt                # Python dependencies
 ## Acknowledgments
 
 Built by [Surya Balaji](https://github.com/SuryaUT) and [Aadi Pulipaka](https://github.com/pulipakaa24).
+
+The robotic hand is based on the [InMoov](https://inmoov.fr/) open-source robot designed by [Ga&euml;l Langevin](https://inmoov.fr/the-story/), licensed under [CC BY-NC](https://creativecommons.org/licenses/by-nc/4.0/).
