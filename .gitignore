@@ -4,20 +4,34 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
+Bucky_Arm_venv/
 
 # PlatformIO
 EMG_Arm/.pio/
 EMG_Arm/.vscode/
 
-# Large data files (too big for GitHub)
-assets/*.hdf5
+# Animations and media
+animations/
+media/
+
+# Master plan
+BUCKY_ARM_MASTER_PLAN.md
+
+# Data files (large HDF5)
+collected_data/
+extra_data/
+assets/
+
+# Model binaries
+models/*.joblib
+
+# Claude
+.claude/
+.claudeignore
 
 # OS
 .DS_Store
 Thumbs.db
 
 .pio
-
 .vscode
-
-.claude
