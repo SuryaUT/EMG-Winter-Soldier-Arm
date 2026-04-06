@@ -35,14 +35,14 @@ EMG Sensors (x4)
 │       │                                 │
 │       ▼                                 │
 │  Feature Extraction (69 features)       │
-│  RMS, MAV, WL, ZC, SSC, AR, FFT,       │
+│  RMS, MAV, WL, ZC, SSC, AR, FFT,        │
 │  band powers, cross-channel correlation │
 │       │                                 │
 │       ▼                                 │
 │  Multi-Model Voting                     │
-│  ┌─────┐  ┌──────────┐  ┌─────┐        │
-│  │ LDA │  │ Ensemble │  │ MLP │        │
-│  └──┬──┘  └────┬─────┘  └──┬──┘        │
+│  ┌─────┐  ┌──────────┐  ┌─────┐         │
+│  │ LDA │  │ Ensemble │  │ MLP │         │
+│  └──┬──┘  └────┬─────┘  └──┬──┘         │
 │     └──────────┼───────────┘            │
 │                ▼                        │
 │  EMA Smoothing + Majority Vote          │
