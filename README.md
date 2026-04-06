@@ -208,6 +208,6 @@ requirements.txt                # Python dependencies
 
 ## Acknowledgments
 
-Built by [Surya Balaji](https://github.com/SuryaUT) and [Aadi Pulipaka](https://github.com/pulipakaa24).
+Built by [Surya Balaji](https://github.com/SuryaUT) and [Aditya Pulipaka](https://github.com/pulipakaa24).
 
 The robotic hand is based on the [InMoov](https://inmoov.fr/) open-source robot designed by [Ga&euml;l Langevin](https://inmoov.fr/the-story/), licensed under [CC BY-NC](https://creativecommons.org/licenses/by-nc/4.0/).
