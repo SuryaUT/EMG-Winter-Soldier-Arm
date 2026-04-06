@@ -9,6 +9,7 @@ Bucky_Arm_venv/
 # PlatformIO
 EMG_Arm/.pio/
 EMG_Arm/.vscode/
+EMG_Arm/components/
 
 # Animations and media
 animations/
@@ -24,6 +25,7 @@ assets/
 
 # Model binaries
 models/*.joblib
+models/*.npz
 
 # Claude
 .claude/

@@ -10,6 +10,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
+#include "dsps_dotprod.h"
 
 #if MODEL_EXPAND_FEATURES
 #include "dsps_fft2r.h"   /* esp-dsp: complex 2-radix FFT */
@@ -483,12 +484,10 @@ void inference_predict_raw(const float *features, float *proba_out) {
   float max_score = -1e9f;
 
   for (int c = 0; c < MODEL_NUM_CLASSES; c++) {
-    float score = LDA_INTERCEPTS[c];
-    for (int f = 0; f < MODEL_NUM_FEATURES; f++) {
-      score += features[f] * LDA_WEIGHTS[c][f];
-    }
-    raw_scores[c] = score;
-    if (score > max_score) max_score = score;
+    float dot;
+    dsps_dotprod_f32(features, LDA_WEIGHTS[c], &dot, MODEL_NUM_FEATURES);
+    raw_scores[c] = dot + LDA_INTERCEPTS[c];
+    if (raw_scores[c] > max_score) max_score = raw_scores[c];
   }
 
   float sum_exp = 0.0f;
@@ -524,13 +523,11 @@ int inference_predict(float *confidence) {
   float max_score = -1e9;
   int max_idx = 0;
 
-  // Calculate raw discriminative scores
+  // Calculate raw discriminative scores (SIMD-accelerated on ESP32-S3)
   for (int c = 0; c < MODEL_NUM_CLASSES; c++) {
-    float score = LDA_INTERCEPTS[c];
-    for (int f = 0; f < MODEL_NUM_FEATURES; f++) {
-      score += features[f] * LDA_WEIGHTS[c][f];
-    }
-    raw_scores[c] = score;
+    float dot;
+    dsps_dotprod_f32(features, LDA_WEIGHTS[c], &dot, MODEL_NUM_FEATURES);
+    raw_scores[c] = dot + LDA_INTERCEPTS[c];
   }
 
   // Convert scores to probabilities (Softmax)

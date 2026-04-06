@@ -9,6 +9,7 @@
 #include "inference_ensemble.h"
 #include "inference.h"
 #include "model_weights.h"
+#include "dsps_dotprod.h"
 
 #if MODEL_USE_ENSEMBLE
 
@@ -61,11 +62,10 @@ static void lda_softmax(const float *feat, int n_feat,
     float sum_exp = 0.0f;
 
     for (int c = 0; c < n_classes; c++) {
-        raw[c] = intercepts[c];
+        float dot;
         const float *w = weights_flat + c * n_feat;
-        for (int f = 0; f < n_feat; f++) {
-            raw[c] += feat[f] * w[f];
-        }
+        dsps_dotprod_f32(feat, w, &dot, n_feat);
+        raw[c] = dot + intercepts[c];
         if (raw[c] > max_raw) max_raw = raw[c];
     }
     for (int c = 0; c < n_classes; c++) {

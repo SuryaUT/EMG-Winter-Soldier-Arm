@@ -256,13 +256,13 @@ class Windower:
             )
 
             # Verification: Print first 10 window start indices and timestamps
-            if not self._verification_printed and self.window_count < 10:
-                start_idx = self.window_count * self.step_size_samples
-                start_time_sec = start_idx / self.sample_rate
-                print(f"[Windower] Window {self.window_count}: start_idx={start_idx}, time={start_time_sec:.3f}s")
-                if self.window_count == 9:
-                    self._verification_printed = True
-                    print(f"[Windower] Verified: 150-sample windows, {self.step_size_samples}-sample hop")
+            # if not self._verification_printed and self.window_count < 10:
+            #     start_idx = self.window_count * self.step_size_samples
+            #     start_time_sec = start_idx / self.sample_rate
+            #     print(f"[Windower] Window {self.window_count}: start_idx={start_idx}, time={start_time_sec:.3f}s")
+            #     if self.window_count == 9:
+            #         self._verification_printed = True
+            #         print(f"[Windower] Verified: 150-sample windows, {self.step_size_samples}-sample hop")
 
             self.window_count += 1
 
@@ -2853,6 +2853,8 @@ def run_classifier_benchmark():
     Purpose: tells you whether accuracy plateau is a features problem
     (all classifiers similar → add features) or a model complexity problem
     (SVM/MLP >> LDA → implement Change E / ensemble).
+
+    Runs twice: once with base 69 features, once with 69 + 36 MPF features (105 total).
     """
     from sklearn.svm import SVC
     from sklearn.neural_network import MLPClassifier
@@ -2873,9 +2875,23 @@ def run_classifier_benchmark():
         print("Need at least 2 gesture classes. Collect more data first.")
         return
 
+    # Base features (69)
     extractor = EMGFeatureExtractor(channels=HAND_CHANNELS, cross_channel=True)
-    X = extractor.extract_features_batch(X_raw)
-    X = EMGClassifier()._apply_session_normalization(X, session_indices, y=y)
+    X_base = extractor.extract_features_batch(X_raw)
+    X_base = EMGClassifier()._apply_session_normalization(X_base, session_indices, y=y)
+
+    # MPF features (36)
+    mpf = MPFFeatureExtractor(channels=HAND_CHANNELS)
+    X_mpf = mpf.extract_batch(X_raw)
+    X_mpf = EMGClassifier()._apply_session_normalization(X_mpf, session_indices, y=y)
+
+    # Combined (105)
+    X_combined = np.hstack([X_base, X_mpf])
+
+    feature_sets = {
+        f'Base ({X_base.shape[1]} features)': X_base,
+        f'Base + MPF ({X_combined.shape[1]} features)': X_combined,
+    }
 
     clfs = {
         'LDA (ESP32 model)': LinearDiscriminantAnalysis(),
@@ -2891,15 +2907,18 @@ def run_classifier_benchmark():
     n_splits = min(5, len(np.unique(trial_ids)))
     gkf = GroupKFold(n_splits=n_splits)
 
-    print(f"\n{'Classifier':<22} {'Mean CV':>8} {'Std':>6}")
-    print("-" * 40)
-    for name, clf in clfs.items():
-        sc = cross_val_score(clf, X, y, cv=gkf, groups=trial_ids, scoring='accuracy')
-        print(f"  {name:<20} {sc.mean()*100:>7.1f}%  ±{sc.std()*100:.1f}%")
+    for feat_name, X in feature_sets.items():
+        print(f"\n--- {feat_name} ---")
+        print(f"  {'Classifier':<22} {'Mean CV':>8} {'Std':>6}")
+        print("  " + "-" * 40)
+        for name, clf in clfs.items():
+            sc = cross_val_score(clf, X, y, cv=gkf, groups=trial_ids, scoring='accuracy')
+            print(f"    {name:<20} {sc.mean()*100:>7.1f}%  ±{sc.std()*100:.1f}%")
 
     print()
-    print("  → If LDA ≈ SVM: features are the bottleneck (add Change 1 features)")
-    print("  → If SVM >> LDA: model complexity bottleneck (implement Change F ensemble)")
+    print("  → If LDA ≈ SVM: features are the bottleneck (add more features)")
+    print("  → If SVM >> LDA: model complexity bottleneck (implement ensemble/MLP)")
+    print("  → Compare Base vs Base+MPF to see if MPF features help")
 
 
 # =============================================================================
