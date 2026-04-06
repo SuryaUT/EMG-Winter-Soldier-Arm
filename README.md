@@ -56,6 +56,22 @@ EMG Sensors (x4)
   Robotic Hand
 ```
 
+## Hardware Pinout
+
+| Component | GPIO | Notes |
+|-----------|------|-------|
+| Thumb Servo | GPIO 1 | LEDC Channel 0 |
+| Index Servo | GPIO 4 | LEDC Channel 1 |
+| Middle Servo | GPIO 5 | LEDC Channel 2 |
+| Ring Servo | GPIO 6 | LEDC Channel 3 |
+| Pinky Servo | GPIO 7 | LEDC Channel 4 |
+| EMG Ch0 (FCR/Belly) | GPIO 2 | ADC1 Channel 1 |
+| EMG Ch1 (Extensors) | GPIO 3 | ADC1 Channel 2 |
+| EMG Ch2 (FCU/Outer Flexors) | GPIO 9 | ADC1 Channel 8 |
+| EMG Ch3 (Bicep) | GPIO 10 | ADC1 Channel 9 |
+
+All servos run at 50 Hz PWM with 14-bit resolution. Duty cycle range: 430 (0 degrees, extended) to 2048 (180 degrees, flexed).
+
 ## Classification Models
 
 Three models run in parallel on the ESP32 and vote on each prediction. Using multiple classifiers with different strengths makes the system more robust than any single model alone.
