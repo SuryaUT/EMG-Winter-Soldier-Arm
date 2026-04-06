@@ -4,8 +4,9 @@
 
 A 3D-printed robotic hand controlled by EMG (electromyography) signals from your forearm. Flex your muscles, and the hand moves. The system runs real-time gesture classification entirely on-device using an ESP32-S3, with no laptop required during inference.
 
-<!-- TODO: Add a photo of the arm here -->
-<!-- ![EMG Winter Soldier Arm](assets/arm_photo.jpg) -->
+![EMG sensors on forearm](images/sensors_on.jpg)
+![Robotic hand with servos](images/arm_servos_open.jpg)
+![Arm with bicep skeleton](images/arm_with_bicep.jpg)
 
 ### Roadmap
 
@@ -25,6 +26,10 @@ A 3D-printed robotic hand controlled by EMG (electromyography) signals from your
 ## How It Works
 
 Four EMG sensors on your forearm pick up electrical signals from muscle contractions. The ESP32 samples these signals at 1 kHz using DMA, extracts features from sliding windows, and classifies them into gestures. The predicted gesture drives five servo motors (one per finger) to mirror your hand movement in real time.
+
+### Demo
+
+[![Live EMG Gesture Classification](https://img.youtube.com/vi/-MC2RbcCA5s/0.jpg)](https://youtu.be/-MC2RbcCA5s)
 
 ### Gestures
 
