@@ -56,12 +56,31 @@ EMG Sensors (x4)
   Robotic Hand
 ```
 
+## Classification Models
+
+Three models run in parallel on the ESP32 and vote on each prediction. Using multiple classifiers with different strengths makes the system more robust than any single model alone.
+
+**LDA (Linear Discriminant Analysis)**
+Lightweight linear classifier trained on all 69 features. Fast to run, serves as the baseline predictor. Weights are exported as a C header and compiled directly into firmware.
+
+**3-Specialist Ensemble**
+Three separate LDA classifiers, each trained on a different feature subset:
+- *Time-domain specialist*: RMS, MAV, waveform length, zero crossings, slope sign changes
+- *Frequency-domain specialist*: Mean/median frequency, peak frequency, band powers
+- *Cross-channel specialist*: Correlation coefficients between EMG channels
+
+A meta-LDA combines their outputs into a final classification. Different gestures are more separable in different feature spaces, so specializing gives better accuracy than a single model on all features.
+
+**Int8 MLP (TFLite Micro)**
+A small multi-layer perceptron quantized to int8 and deployed via TensorFlow Lite Micro. Captures nonlinear decision boundaries that LDA misses.
+
+**Voting and Smoothing**
+The three models each cast a vote. The final prediction is then passed through EMA smoothing, a sliding-window majority vote, and transition debounce to prevent jittery servo movement.
+
 ## Features
 
 - **On-device inference**: All classification runs on the ESP32-S3. No laptop in the loop.
-- **Multi-model voting**: Three classifiers (LDA, 3-specialist ensemble, int8 MLP via TFLite Micro) vote on each prediction for robustness.
 - **69 EMG features**: Time-domain (RMS, MAV, waveform length, zero crossings, slope sign changes, Hjorth parameters, autoregressive coefficients), frequency-domain (mean/median frequency, peak frequency, spectral band powers via FFT), and cross-channel correlation.
-- **Adaptive smoothing**: EMA smoothing, sliding-window majority vote, and transition debounce prevent jittery output.
 - **Z-score calibration**: Per-user calibration stored in NVS flash, so the system adapts to different forearm placements and muscle strengths.
 - **Full training pipeline**: Python GUI for data collection, signal visualization, model training, and live prediction. Train a new model and export C header weights in one workflow.
 - **BLE control**: Connect via Bluetooth to start/stop streaming, trigger calibration, or switch between on-device and laptop-side prediction.
@@ -148,16 +167,6 @@ requirements.txt                # Python dependencies
 3. Collect training data (guided gesture prompts with live EMG visualization)
 4. Train models (LDA, ensemble, MLP) from the GUI
 5. Export weights to C headers for on-device deployment
-
-## How the Ensemble Works
-
-The ensemble uses three specialist LDA classifiers, each trained on a different feature subset:
-
-1. **Time-domain specialist**: RMS, MAV, waveform length, zero crossings, slope sign changes
-2. **Frequency-domain specialist**: Mean/median frequency, peak frequency, band powers
-3. **Cross-channel specialist**: Correlation coefficients between EMG channels
-
-A meta-LDA combines the three specialists' predictions into a final classification. This is more robust than any single model because different gestures are more separable in different feature spaces.
 
 ## Acknowledgments
 
