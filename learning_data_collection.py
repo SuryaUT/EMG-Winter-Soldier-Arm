@@ -1704,11 +1704,18 @@ class EMGFeatureExtractor:
         if self.expanded and self.cross_channel and len(channel_indices) >= 2:
             centered = []
             for ch in channel_indices:
-                sig = window[:, ch] - np.mean(window[:, ch])
-                # Apply bandpass if enabled (matches firmware pipeline order)
+                sig = window[:, ch]
+                # Match extract_features_single_channel order EXACTLY: bandpass
+                # (seeded from the RAW first sample) -> DC removal -> reinhard.
+                # The previous order (subtract mean before bandpass) seeded the
+                # filter from a different value, so in the live single-window path
+                # these cross-channel signals did not match the per-channel signals
+                # whose RMS divides them in corr/cov. In batch mode bandpass is
+                # pre-applied (disabled here) so this reordering is a no-op there.
                 if self.bandpass and self._bp_sos is not None:
                     zi = sosfilt_zi(self._bp_sos) * sig[0]
                     sig, _ = sosfilt(self._bp_sos, sig, zi=zi)
+                sig = sig - np.mean(sig)
                 if self.reinhard:
                     sig = 64.0 * sig / (32.0 + np.abs(sig))
                 centered.append(sig)
@@ -2689,6 +2696,7 @@ class PredictionSmoother:
         probability_smoothing: float = 0.7,
         majority_vote_window: int = 5,
         debounce_count: int = 3,
+        reject_threshold: float = 0.0,
     ):
         """
         Args:
@@ -2697,12 +2705,18 @@ class PredictionSmoother:
                                    0 = no smoothing, 0.9 = very smooth
             majority_vote_window: Number of past predictions to consider for voting
             debounce_count: Number of consecutive same predictions needed to change output
+            reject_threshold: If the smoothed peak probability is below this, hold
+                              the last confirmed output and skip the vote/debounce
+                              update — mirrors the firmware vote_postprocess()
+                              confidence gate. Default 0.0 disables the gate (legacy
+                              GUI behaviour). Set to 0.40 to match the firmware.
         """
         self.label_names = label_names
         self.n_classes = len(label_names)
 
         # Probability smoothing (Exponential Moving Average)
         self.prob_smoothing = probability_smoothing
+        self.reject_threshold = reject_threshold
         self.smoothed_proba = np.ones(self.n_classes) / self.n_classes  # Start uniform
 
         # Majority vote
@@ -2746,6 +2760,22 @@ class PredictionSmoother:
         prob_smoothed_idx = np.argmax(self.smoothed_proba)
         prob_smoothed_label = self.label_names[prob_smoothed_idx]
         prob_smoothed_confidence = self.smoothed_proba[prob_smoothed_idx]
+
+        # --- 1b. Confidence rejection (matches firmware vote_postprocess) ---
+        # When the smoothed peak is too low, hold the last confirmed output and do
+        # NOT update the vote history / debounce state. Skipped when threshold=0.
+        if prob_smoothed_confidence < self.reject_threshold:
+            return (
+                self.current_output,
+                float(prob_smoothed_confidence),
+                {
+                    'raw_label': predicted_label,
+                    'raw_confidence': float(np.max(probabilities)),
+                    'prob_smoothed_label': prob_smoothed_label,
+                    'prob_smoothed_confidence': float(prob_smoothed_confidence),
+                    'rejected': True,
+                },
+            )
 
         # --- 2. Majority Vote ---
         # Add to history and keep window size

@@ -3042,11 +3042,14 @@ class PredictionPage(BasePage):
         print(f"[Prediction] Active models: {' + '.join(model_names)} ({len(model_names)} total)")
 
         # Create smoother
+        # Params match the firmware vote_postprocess() exactly (EMA 0.70, vote 5,
+        # debounce 3, reject 0.40) so the laptop display mirrors on-device output.
         self.smoother = PredictionSmoother(
             label_names=self.classifier.label_names,
             probability_smoothing=0.7,
             majority_vote_window=5,
-            debounce_count=4,
+            debounce_count=3,
+            reject_threshold=0.40,
         )
 
         # Start raw EMG streaming from ESP32
@@ -3171,41 +3174,48 @@ class PredictionPage(BasePage):
 
                 window_data = window.to_numpy()
 
-                # --- Base LDA prediction (includes energy gate + calibration) ---
-                raw_label, proba_lda = self.classifier.predict(window_data)
+                # Extract + calibrate features ONCE, then run every model on the
+                # same vector — mirrors firmware inference_extract_features() and
+                # live_predict.py. No energy gate: the firmware multi-model voting
+                # path (inference_*_predict_raw + vote_postprocess) does not gate on
+                # activity, so the laptop path must not either, for output parity.
+                features_raw = self.classifier.feature_extractor.extract_features_window(window_data)
+                features = self.classifier.calibration_transform.apply(features_raw)
 
-                # If energy gate triggered rest, skip other models
-                rest_gated = (raw_label == "rest" and proba_lda.max() == 1.0)
+                # Single LDA (full softmax, matches firmware inference_predict_raw)
+                proba_lda = self.classifier.model.predict_proba([features])[0]
+                probas = [proba_lda]
 
-                if rest_gated:
-                    avg_proba = proba_lda
-                else:
-                    # Extract calibrated features for ensemble/MLP
-                    features_raw = self.classifier.feature_extractor.extract_features_window(window_data)
-                    features = self.classifier.calibration_transform.apply(features_raw)
+                # --- Ensemble (full softmax) ---
+                if self._ensemble:
+                    try:
+                        probas.append(self._run_ensemble(features))
+                    except Exception:
+                        pass
 
-                    probas = [proba_lda]
+                # --- MLP (folded as soft one-hot to match firmware main.c) ---
+                if self._mlp:
+                    try:
+                        mlp_soft  = self._run_mlp(features)
+                        mlp_cls   = int(np.argmax(mlp_soft))
+                        mlp_conf  = float(mlp_soft[mlp_cls])
+                        K         = len(self.classifier.label_names)
+                        remainder = (1.0 - mlp_conf) / (K - 1)
+                        folded = np.full(K, remainder)
+                        folded[mlp_cls] = mlp_conf
+                        probas.append(folded)
+                    except Exception:
+                        pass
 
-                    # --- Ensemble ---
-                    if self._ensemble:
-                        try:
-                            probas.append(self._run_ensemble(features))
-                        except Exception:
-                            pass
-
-                    # --- MLP ---
-                    if self._mlp:
-                        try:
-                            probas.append(self._run_mlp(features))
-                        except Exception:
-                            pass
-
-                    avg_proba = np.mean(probas, axis=0)
+                avg_proba = np.mean(probas, axis=0)
 
                 raw_label = self.classifier.label_names[int(np.argmax(avg_proba))]
 
-                # Apply smoothing
+                # Apply smoothing (mirrors firmware vote_postprocess, incl. reject gate)
                 smoothed_label, smoothed_conf, _debug = self.smoother.update(raw_label, avg_proba)
+                # Before the first confident prediction the smoother holds None.
+                if smoothed_label is None:
+                    smoothed_label = raw_label
 
                 self.data_queue.put(('prediction', (smoothed_label, smoothed_conf)))
 

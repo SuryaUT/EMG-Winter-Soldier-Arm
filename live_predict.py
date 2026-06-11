@@ -33,6 +33,7 @@ import serial
 sys.path.insert(0, str(Path(__file__).parent))
 from learning_data_collection import (
     EMGClassifier,
+    PredictionSmoother,
     NUM_CHANNELS,
     SAMPLING_RATE_HZ,
     WINDOW_SIZE_MS,
@@ -233,9 +234,29 @@ def main():
     calib_std  = None
     if not args.no_calib:
         n_calib = max(20, int(CALIB_SECS * 1000 / HOP_SIZE_MS))
-        calib_mean, calib_std = collect_calibration_windows(ser, n_calib, extractor)
+        calib_mean, calib_rest_std = collect_calibration_windows(ser, n_calib, extractor)
+        # Match firmware calibration_apply(): offset = REST mean, scale =
+        # training sigma_train (NOT the REST-only std, which is far smaller and
+        # saturates the softmax — the same bug that was fixed on-device).
+        sigma_train = getattr(classifier.calibration_transform, 'sigma_train', None)
+        if sigma_train is not None and len(sigma_train) == len(calib_mean):
+            calib_std = np.asarray(sigma_train, dtype=np.float32)
+            print("[Calib] Scale = training sigma_train (matches firmware).")
+        else:
+            calib_std = calib_rest_std
+            print("[Calib] sigma_train unavailable — using REST std (legacy fallback).")
     else:
         print("[Calib] Skipped (--no-calib). Accuracy may be reduced.")
+
+    # Post-processing identical to firmware vote_postprocess(): EMA 0.70,
+    # majority vote 5, debounce 3, confidence reject at args.confidence.
+    smoother = PredictionSmoother(
+        classifier.label_names,
+        probability_smoothing=0.70,
+        majority_vote_window=5,
+        debounce_count=3,
+        reject_threshold=args.confidence,
+    )
 
     # ── Live prediction loop ─────────────────────────────────────────────────
     print(f"\n[Predict] Running. Confidence threshold: {args.confidence:.2f}")
@@ -277,7 +298,11 @@ def main():
                 if calib_mean is not None:
                     feat = (feat - calib_mean) / calib_std
 
-                # Run all available models and average probabilities
+                # Run all available models and average probabilities — mirrors the
+                # firmware multi-model voting (main.c): single LDA and ensemble use
+                # full softmax; the MLP is folded as a soft one-hot (winner=conf,
+                # remaining mass split evenly) before averaging.
+                K = len(classifier.label_names)
                 probas = [classifier.model.predict_proba([feat])[0]]
                 if ensemble:
                     try:
@@ -286,17 +311,25 @@ def main():
                         pass
                 if mlp:
                     try:
-                        probas.append(run_mlp(mlp, feat))
+                        mlp_soft  = run_mlp(mlp, feat)
+                        mlp_cls   = int(np.argmax(mlp_soft))
+                        mlp_conf  = float(mlp_soft[mlp_cls])
+                        remainder = (1.0 - mlp_conf) / (K - 1)
+                        folded = np.full(K, remainder, dtype=np.float64)
+                        folded[mlp_cls] = mlp_conf
+                        probas.append(folded)
                     except Exception:
                         pass
-                proba      = np.mean(probas, axis=0)
-                class_idx  = int(np.argmax(proba))
-                confidence = float(proba[class_idx])
-                gesture    = classifier.label_names[class_idx]
+                proba = np.mean(probas, axis=0)
+
+                # Shared post-processing identical to firmware vote_postprocess().
+                raw_label = classifier.label_names[int(np.argmax(proba))]
+                gesture, confidence, dbg = smoother.update(raw_label, proba)
                 n_inferences += 1
 
-                # Reject below threshold
-                if confidence < args.confidence:
+                # Held output (gesture is None until first confident prediction) or
+                # confidence-rejected → don't actuate.
+                if gesture is None or dbg.get('rejected'):
                     n_rejected += 1
                     continue
 
