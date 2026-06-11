@@ -17,37 +17,24 @@ from sklearn.model_selection import cross_val_predict, GroupKFold, cross_val_sco
 import sys
 sys.path.insert(0, str(Path(__file__).parent))
 from learning_data_collection import (
-    SessionStorage, EMGFeatureExtractor, HAND_CHANNELS
+    SessionStorage, make_feature_extractor, build_training_matrix, HAND_CHANNELS
 )
 
-# --- Load and extract features -----------------------------------------------
+# --- Load + shared training pipeline -----------------------------------------
 storage = SessionStorage()
 X_raw, y, trial_ids, session_indices, label_names, _ = storage.load_all_for_training()
 
-extractor = EMGFeatureExtractor(channels=HAND_CHANNELS, cross_channel=True, expanded=True, reinhard=True)
-X = extractor.extract_features_batch(X_raw).astype(np.float64)
+# build_training_matrix is the ONE pipeline shared with EMGClassifier.train and
+# train_mlp_tflite.py: augment 3x -> extract (ground-truth feature switches) ->
+# per-session class-balanced z-score with REAL-only stats. trial_ids and
+# session_indices are tiled in lockstep with the augmented rows, so the
+# GroupKFold out-of-fold stacking below keeps a window's augmented copies in the
+# same fold — without this the meta-LDA would train on leaked specialist probs.
+X, y, session_indices, trial_ids, sigma_train = build_training_matrix(
+    X_raw, y, session_indices=session_indices, trial_ids=trial_ids, augment=True)
+X = X.astype(np.float64)
 
-# Per-session class-balanced normalization
-# Must match EMGClassifier._apply_session_normalization():
-#   mean = average of per-class means (not overall mean), std = overall std.
-# StandardScaler uses overall mean, which biases toward the majority class.
-for sid in np.unique(session_indices):
-    mask = session_indices == sid
-    X_sess = X[mask]
-    y_sess = y[mask]
-
-    # Class-balanced mean: average of per-class centroids
-    class_means = []
-    for cls in np.unique(y_sess):
-        class_means.append(X_sess[y_sess == cls].mean(axis=0))
-    balanced_mean = np.mean(class_means, axis=0)
-
-    # Overall std (same as StandardScaler)
-    std = X_sess.std(axis=0)
-    std[std < 1e-12] = 1.0  # avoid division by zero
-
-    X[mask] = (X_sess - balanced_mean) / std
-
+extractor = make_feature_extractor(channels=HAND_CHANNELS)
 feat_names = extractor.get_feature_names(n_channels=len(HAND_CHANNELS))
 n_cls = len(np.unique(y))
 

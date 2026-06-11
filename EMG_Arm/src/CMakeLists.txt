@@ -16,6 +16,7 @@ set(HAL_SOURCES
 set(DRIVER_SOURCES
     drivers/hand.c
     drivers/emg_sensor.c
+    drivers/replay_data.c
 )
 
 set(CORE_SOURCES

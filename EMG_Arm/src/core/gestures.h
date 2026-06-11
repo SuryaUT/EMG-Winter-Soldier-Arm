@@ -27,6 +27,8 @@
  */
 void gestures_execute(gesture_t gesture);
 
+gesture_t gestures_index_to_gesture(int gesture_idx);
+
 gesture_t parse_gesture(const char *s);
 
 /**

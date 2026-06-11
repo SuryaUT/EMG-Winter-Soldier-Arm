@@ -1435,6 +1435,43 @@ def run_storage_demo():
 # FEATURE EXTRACTION (Time-domain features for EMG)
 # =============================================================================
 
+# ════════════════════════════════════════════════════════════════════════════
+# FEATURE-PIPELINE GROUND TRUTH  (single source of truth — edit HERE only)
+# ════════════════════════════════════════════════════════════════════════════
+# These three switches define the feature space shared by EVERY deployed model —
+# the single LDA (GUI), the 3-specialist + meta ensemble, and the int8 MLP — as
+# well as the firmware. All three models consume ONE on-device feature vector, so
+# if any training path disagrees on these flags the models silently break.
+# Change a value HERE and it propagates to every training/serving path through
+# make_feature_extractor(); the exporter writes the matching firmware #defines.
+#
+#   FEATURE_REINHARD   <-> firmware MODEL_USE_REINHARD        (model_weights.h)
+#   FEATURE_EXPANDED   <-> firmware MODEL_EXPAND_FEATURES     (cross-channel rides along)
+#   FEATURE_NORMALIZE  <-> firmware MODEL_NORMALIZE_FEATURES
+FEATURE_REINHARD  = True   # Reinhard tone-map 64·x/(32+|x|) before extraction
+FEATURE_EXPANDED  = True   # 20-feat/channel set (+ cross-channel); False = legacy TD-4
+FEATURE_NORMALIZE = True   # divide amplitude feats (rms,wl,mav,iemg) by total RMS
+
+
+def make_feature_extractor(channels=None, bandpass=True, **overrides):
+    """Build an EMGFeatureExtractor from the ground-truth switches above.
+
+    ALWAYS use this for model-facing feature extraction (LDA / ensemble / MLP /
+    GUI diagnostics that claim to "match training") so the three models can never
+    drift apart on the one shared firmware feature vector. `overrides` is an
+    escape hatch for non-model utilities only (e.g. legacy TD-4 visualisation).
+    """
+    cfg = dict(
+        reinhard=FEATURE_REINHARD,
+        expanded=FEATURE_EXPANDED,
+        normalize=FEATURE_NORMALIZE,
+        cross_channel=FEATURE_EXPANDED,   # cross-channel only meaningful when expanded
+        bandpass=bandpass,
+    )
+    cfg.update(overrides)
+    return EMGFeatureExtractor(channels=channels, **cfg)
+
+
 class EMGFeatureExtractor:
     """
     Extracts time-domain and frequency-domain features from EMG windows.
@@ -1702,12 +1739,20 @@ class EMGFeatureExtractor:
         Returns:
             (n_windows, n_features) float32 array.
         """
-        # Vectorised bandpass: apply sosfiltfilt on all windows at once along
-        # the samples axis.  This is ~100x faster than per-window sosfilt calls
-        # (scipy's C loop vs Python loop).  We disable per-window bandpass in
-        # extract_features_single_channel during batch extraction.
+        # Vectorised CAUSAL bandpass: apply sosfilt (forward-only) on all windows
+        # at once along the samples axis.  This matches the firmware's causal
+        # biquad and the live single-window path — using sosfiltfilt here instead
+        # would train on zero-phase, double-order data the device can never
+        # reproduce (train/serve skew).  Per-window initial conditions are seeded
+        # from each window/channel's first sample (sosfilt_zi * x0), identical to
+        # extract_features_single_channel.  We disable the per-window bandpass in
+        # the loop below so it is not applied twice.
         if self.bandpass and self._bp_sos is not None:
-            X = sosfiltfilt(self._bp_sos, X, axis=1).astype(np.float32)
+            zi_base = sosfilt_zi(self._bp_sos)            # (n_sections, 2)
+            x0      = X[:, 0, :]                          # (n_windows, n_channels)
+            zi      = zi_base[:, None, :, None] * x0[None, :, None, :]
+            X, _    = sosfilt(self._bp_sos, X, axis=1, zi=zi)
+            X       = X.astype(np.float32)
 
         n_windows  = X.shape[0]
         n_ch_total = X.shape[2]
@@ -1994,6 +2039,97 @@ def augment_emg_batch(
     return np.concatenate(aug_X), np.concatenate(aug_y)
 
 
+def _session_zscore(X_feat: np.ndarray, y: Optional[np.ndarray],
+                    session_indices: np.ndarray,
+                    real_mask: Optional[np.ndarray] = None):
+    """Per-session z-score with a class-balanced mean.
+
+    Normalization statistics (mu, sigma) are computed ONLY from rows where
+    `real_mask` is True — the real, non-augmented windows — and then applied to
+    every row of the session (real + augmented). Augmentation expands the dataset;
+    it must not redefine the deployment scale, which has to match the real live
+    EMG the firmware sees. When `real_mask` is None all rows are used (no
+    augmentation case), preserving legacy behaviour.
+
+    Returns (X_norm, sigma_train) where sigma_train is the mean per-session sigma.
+    This is the SINGLE normalization implementation shared by EMGClassifier.train,
+    train_ensemble.py and train_mlp_tflite.py (via build_training_matrix) and by
+    cross_validate (via _apply_session_normalization).
+    """
+    n = len(X_feat)
+    if real_mask is None:
+        real_mask = np.ones(n, dtype=bool)
+    X_norm = X_feat.copy()
+    session_sigmas = []
+    for sid in np.unique(session_indices):
+        mask = session_indices == sid
+        stat_rows = mask & real_mask            # real rows of this session only
+        X_stat = X_feat[stat_rows]
+        if y is not None:
+            y_stat = y[stat_rows]
+            class_means = [X_stat[y_stat == cls].mean(axis=0)
+                           for cls in np.unique(y_stat)]
+            mu = np.mean(class_means, axis=0)   # class-balanced origin
+        else:
+            mu = X_stat.mean(axis=0)
+        sigma = X_stat.std(axis=0) + 1e-8       # additive epsilon floor
+        session_sigmas.append(sigma)
+        X_norm[mask] = (X_feat[mask] - mu) / sigma
+    sigma_train = np.mean(session_sigmas, axis=0)
+    return X_norm, sigma_train
+
+
+def build_training_matrix(X_raw: np.ndarray, y: np.ndarray,
+                          session_indices: Optional[np.ndarray] = None,
+                          trial_ids: Optional[np.ndarray] = None,
+                          augment: bool = True,
+                          augment_multiplier: int = 3,
+                          feature_extractor: Optional['EMGFeatureExtractor'] = None):
+    """SINGLE SOURCE OF TRUTH: raw EMG windows -> normalized feature matrix.
+
+    Used by EMGClassifier.train, train_ensemble.py, and train_mlp_tflite.py so all
+    three models train on byte-identical inputs (same augmentation seed, same
+    feature switches, same normalization). Pipeline:
+
+      1. Optional augmentation (dataset expansion only). `y`, `session_indices`
+         and `trial_ids` are tiled in lockstep so grouped CV keeps a window's
+         augmented copies in the same fold — this is what prevents the ensemble's
+         out-of-fold meta-stacking from leaking.
+      2. Feature extraction via the ground-truth make_feature_extractor().
+      3. Per-session z-score whose stats (mu, sigma) AND the returned sigma_train
+         come from REAL rows only (see _session_zscore). Skipped when
+         session_indices is None (sigma_train returned as None).
+
+    Returns (X_feat, y, session_indices, trial_ids, sigma_train) with the label/
+    group arrays tiled to match X_feat's rows.
+    """
+    n_real = len(X_raw)
+
+    if augment:
+        # augment_emg_batch returns [real, aug1, aug2, ...] concatenated, so the
+        # first n_real rows are real. y is returned already tiled; tile the groups
+        # with the SAME multiplier so every row stays aligned.
+        X_proc, y = augment_emg_batch(X_raw, y, multiplier=augment_multiplier)
+        if session_indices is not None:
+            session_indices = np.tile(session_indices, augment_multiplier)
+        if trial_ids is not None:
+            trial_ids = np.tile(trial_ids, augment_multiplier)
+    else:
+        X_proc = X_raw
+
+    if feature_extractor is None:
+        feature_extractor = make_feature_extractor(channels=HAND_CHANNELS)
+    X_feat = feature_extractor.extract_features_batch(X_proc)
+
+    sigma_train = None
+    if session_indices is not None:
+        real_mask = np.zeros(len(X_feat), dtype=bool)
+        real_mask[:n_real] = True   # real rows are first (concat order guarantees it)
+        X_feat, sigma_train = _session_zscore(X_feat, y, session_indices, real_mask)
+
+    return X_feat, y, session_indices, trial_ids, sigma_train
+
+
 # =============================================================================
 # LDA CLASSIFIER
 # =============================================================================
@@ -2010,7 +2146,7 @@ class EMGClassifier:
     def __init__(self, model_type: str = "lda", reg_param: float = 0.1):
         self.model_type = model_type.lower()
         self.reg_param = reg_param  # only used by QDA
-        self.feature_extractor = EMGFeatureExtractor(channels=HAND_CHANNELS, reinhard=True)
+        self.feature_extractor = make_feature_extractor(channels=HAND_CHANNELS)
         if self.model_type == "qda":
             self.model = QuadraticDiscriminantAnalysis(reg_param=reg_param)
         else:
@@ -2021,7 +2157,8 @@ class EMGClassifier:
         self.calibration_transform = CalibrationTransform()
 
     def train(self, X: np.ndarray, y: np.ndarray, label_names: list[str],
-              session_indices: Optional[np.ndarray] = None):
+              session_indices: Optional[np.ndarray] = None,
+              trial_ids: Optional[np.ndarray] = None):
         """
         Train the classifier.
 
@@ -2032,34 +2169,29 @@ class EMGClassifier:
             session_indices: Optional per-window integer session ID (0..n_sessions-1).
                              When provided, each session's features are independently
                              z-scored before fitting, creating a placement-invariant model.
+            trial_ids: Optional per-window trial ID; passed through build_training_matrix
+                       (tiled with augmentation) for callers that need grouped CV.
+
+        Uses the shared build_training_matrix() pipeline so the single LDA, the
+        ensemble (train_ensemble.py) and the MLP (train_mlp_tflite.py) train on
+        byte-identical inputs.
         """
-        # Change 3: data augmentation on raw windows before feature extraction
-        if getattr(self, 'use_augmentation', True):
-            X_aug, y_aug = augment_emg_batch(X, y, multiplier=3)
-            print(f"[Classifier] Augmentation: {len(X)} -> {len(X_aug)} windows")
-            # Replicate session_indices to match the augmented size
-            if session_indices is not None:
-                session_indices = np.tile(session_indices, 3)
-        else:
-            X_aug, y_aug = X, y
+        augment = getattr(self, 'use_augmentation', True)
+        X_features, y_aug, session_indices, trial_ids, sigma_train = build_training_matrix(
+            X, y,
+            session_indices=session_indices,
+            trial_ids=trial_ids,
+            augment=augment,
+            feature_extractor=self.feature_extractor,
+        )
+        self.feature_names = self.feature_extractor.get_feature_names(X.shape[2])
+        if sigma_train is not None:
+            # Real-row sigma_train is the deployment scale baked into the firmware.
+            self.calibration_transform.sigma_train = sigma_train
 
-        print("\n[Classifier] Extracting features...")
-        X_features = self.feature_extractor.extract_features_batch(X_aug)
-        self.feature_names = self.feature_extractor.get_feature_names(X_aug.shape[2])
-
-        # Change 6: optionally stack MPF features
-        if getattr(self, 'use_mpf', False):
-            mpf = MPFFeatureExtractor(channels=HAND_CHANNELS)
-            X_features = np.hstack([X_features, mpf.extract_batch(X_aug)])
-
-        print(f"[Classifier] Feature matrix shape: {X_features.shape}")
-        print(f"[Classifier] Features per window: {len(self.feature_names)}")
-
-        if session_indices is not None:
-            n_sessions = len(np.unique(session_indices))
-            print(f"\n[Classifier] Applying per-session z-score normalization ({n_sessions} sessions, class-balanced mu)...")
-            X_features = self._apply_session_normalization(X_features, session_indices, y=y_aug)
-
+        print(f"[Classifier] Feature matrix: {X_features.shape} "
+              f"({'augmented 3x' if augment else 'real-only'}, "
+              f"{'per-session z-scored' if sigma_train is not None else 'unnormalized'})")
         print(f"\n[Classifier] Training {self.model_type.upper()}...")
         self.model.fit(X_features, y_aug)
         self.label_names = label_names
@@ -2079,31 +2211,13 @@ class EMGClassifier:
         """
         Z-score each session's features independently using a class-balanced mean.
 
-        For each session:
-          - mu    = mean of per-class centroids (class-balanced, not weighted by window count)
-          - sigma = overall std of all windows in the session
-
-        Using the class-balanced mean prevents sessions with more rest windows (or any
-        imbalanced class) from skewing the normalization origin toward that class.
+        Thin wrapper around the shared _session_zscore() so this path (used by
+        cross_validate, no augmentation) and build_training_matrix() can never
+        drift apart. With no augmentation real_mask=None, i.e. stats use all rows.
         """
-        X_norm = X_features.copy()
-        session_sigmas = []
-        for sid in np.unique(session_indices):
-            mask = session_indices == sid
-            X_sess = X_features[mask]
-            if y is not None:
-                # Class-balanced mean: average of per-class centroids
-                y_sess = y[mask]
-                class_means = [X_sess[y_sess == cls].mean(axis=0)
-                               for cls in np.unique(y_sess)]
-                mu = np.mean(class_means, axis=0)
-            else:
-                mu = X_sess.mean(axis=0)
-            sigma = X_sess.std(axis=0) + 1e-8
-            session_sigmas.append(sigma)
-            X_norm[mask] = (X_sess - mu) / sigma
+        X_norm, sigma_train = _session_zscore(X_features, y, session_indices, real_mask=None)
         # Store mean per-session sigma so calibration can use the same scale reference
-        self.calibration_transform.sigma_train = np.mean(session_sigmas, axis=0)
+        self.calibration_transform.sigma_train = sigma_train
         return X_norm
 
     def evaluate(self, X: np.ndarray, y: np.ndarray) -> dict:
@@ -2414,9 +2528,34 @@ class EMGClassifier:
             if line.strip():
                 c_content.append(line.rstrip(", "))
             c_content.append("    },")
-            
+
         c_content.append("};")
         c_content.append("")
+
+        # Training-time feature std (sigma_train). The firmware divides live
+        # features by this fixed scale instead of the much smaller REST-only std,
+        # placing them in the same normalized space the model was trained on.
+        # The per-session REST mean is still used as the offset (placement drift).
+        sigma_train = getattr(self.calibration_transform, 'sigma_train', None)
+        if sigma_train is not None and len(sigma_train) == n_features:
+            c_content.append("/* Training-time feature std (sigma_train) for calibration scaling */")
+            c_content.append("#define MODEL_HAS_TRAIN_STD 1")
+            c_content.append("static const float MODEL_FEAT_STD[MODEL_NUM_FEATURES] = {")
+            line = "    "
+            for j, val in enumerate(sigma_train):
+                line += f"{float(val):.8f}f, "
+                if (j + 1) % 8 == 0:
+                    c_content.append(line)
+                    line = "    "
+            if line.strip():
+                c_content.append(line.rstrip(", "))
+            c_content.append("};")
+            c_content.append("")
+        else:
+            c_content.append("/* sigma_train unavailable at export — firmware falls back to REST-std flooring */")
+            c_content.append("#define MODEL_HAS_TRAIN_STD 0")
+            c_content.append("")
+
         c_content.append("#endif /* MODEL_WEIGHTS_H */")
 
         with open(filepath, 'w') as f:
@@ -2876,7 +3015,7 @@ def run_classifier_benchmark():
         return
 
     # Base features (69)
-    extractor = EMGFeatureExtractor(channels=HAND_CHANNELS, cross_channel=True)
+    extractor = make_feature_extractor(channels=HAND_CHANNELS)
     X_base = extractor.extract_features_batch(X_raw)
     X_base = EMGClassifier()._apply_session_normalization(X_base, session_indices, y=y)
 
@@ -3121,7 +3260,7 @@ def run_visualization_demo():
     print(f"[Unique trials: {len(np.unique(trial_ids))}]")
 
     # Extract features (forearm channels only, matching hand classifier)
-    extractor = EMGFeatureExtractor(channels=HAND_CHANNELS)
+    extractor = make_feature_extractor(channels=HAND_CHANNELS)
     X_features = extractor.extract_features_batch(X)
 
     # Train LDA

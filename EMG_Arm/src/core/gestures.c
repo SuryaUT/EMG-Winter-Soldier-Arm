@@ -52,6 +52,10 @@ void gestures_execute(gesture_t gesture)
     }
 }
 
+gesture_t gestures_index_to_gesture(int gesture_idx){
+    return (gesture_t) (gesture_idx + 1);
+}
+
 gesture_t parse_gesture(const char *s)
 {
     if (strcmp(s, "rest") == 0)       return GESTURE_REST;
@@ -79,49 +83,49 @@ const char* gestures_get_name(gesture_t gesture)
 
 void gesture_open(void)
 {
-    hand_set_finger_angle(FINGER_THUMB, minAngles[FINGER_THUMB]);
-    hand_set_finger_angle(FINGER_INDEX, minAngles[FINGER_INDEX]);
-    hand_set_finger_angle(FINGER_MIDDLE, minAngles[FINGER_MIDDLE]);
-    hand_set_finger_angle(FINGER_RING, minAngles[FINGER_RING]);
-    hand_set_finger_angle(FINGER_PINKY, minAngles[FINGER_PINKY]);
+    hand_set_finger_angle(JOINT_THUMB, minAngles[JOINT_THUMB]);
+    hand_set_finger_angle(JOINT_INDEX, minAngles[JOINT_INDEX]);
+    hand_set_finger_angle(JOINT_MIDDLE, minAngles[JOINT_MIDDLE]);
+    hand_set_finger_angle(JOINT_RING, minAngles[JOINT_RING]);
+    hand_set_finger_angle(JOINT_PINKY, minAngles[JOINT_PINKY]);
 }
 
 void gesture_fist(void)
 {
-    hand_set_finger_angle(FINGER_INDEX, maxAngles[FINGER_INDEX]);
-    hand_set_finger_angle(FINGER_MIDDLE, maxAngles[FINGER_MIDDLE]);
-    hand_set_finger_angle(FINGER_RING, maxAngles[FINGER_RING]);
-    hand_set_finger_angle(FINGER_PINKY, maxAngles[FINGER_PINKY]);
-    hand_set_finger_angle(FINGER_THUMB, maxAngles[FINGER_THUMB]);
+    hand_set_finger_angle(JOINT_INDEX, maxAngles[JOINT_INDEX]);
+    hand_set_finger_angle(JOINT_MIDDLE, maxAngles[JOINT_MIDDLE]);
+    hand_set_finger_angle(JOINT_RING, maxAngles[JOINT_RING]);
+    hand_set_finger_angle(JOINT_PINKY, maxAngles[JOINT_PINKY]);
+    hand_set_finger_angle(JOINT_THUMB, maxAngles[JOINT_THUMB]);
 }
 
 void gesture_hook_em(void)
 {
     /* Index and pinky extended, others flexed */
-    hand_set_finger_angle(FINGER_THUMB, maxAngles[FINGER_THUMB]);
-    hand_set_finger_angle(FINGER_INDEX, minAngles[FINGER_INDEX]);
-    hand_set_finger_angle(FINGER_MIDDLE, maxAngles[FINGER_MIDDLE]);
-    hand_set_finger_angle(FINGER_RING, maxAngles[FINGER_RING]);
-    hand_set_finger_angle(FINGER_PINKY, minAngles[FINGER_PINKY]);
+    hand_set_finger_angle(JOINT_THUMB, maxAngles[JOINT_THUMB]);
+    hand_set_finger_angle(JOINT_INDEX, minAngles[JOINT_INDEX]);
+    hand_set_finger_angle(JOINT_MIDDLE, maxAngles[JOINT_MIDDLE]);
+    hand_set_finger_angle(JOINT_RING, maxAngles[JOINT_RING]);
+    hand_set_finger_angle(JOINT_PINKY, minAngles[JOINT_PINKY]);
 }
 
 void gesture_thumbs_up(void)
 {
     /* Thumb extended, others flexed */
-    hand_set_finger_angle(FINGER_THUMB, minAngles[FINGER_THUMB]);
-    hand_set_finger_angle(FINGER_INDEX, maxAngles[FINGER_INDEX]);
-    hand_set_finger_angle(FINGER_MIDDLE, maxAngles[FINGER_MIDDLE]);
-    hand_set_finger_angle(FINGER_RING, maxAngles[FINGER_RING]);
-    hand_set_finger_angle(FINGER_PINKY, maxAngles[FINGER_PINKY]);
+    hand_set_finger_angle(JOINT_THUMB, minAngles[JOINT_THUMB]);
+    hand_set_finger_angle(JOINT_INDEX, maxAngles[JOINT_INDEX]);
+    hand_set_finger_angle(JOINT_MIDDLE, maxAngles[JOINT_MIDDLE]);
+    hand_set_finger_angle(JOINT_RING, maxAngles[JOINT_RING]);
+    hand_set_finger_angle(JOINT_PINKY, maxAngles[JOINT_PINKY]);
 }
 
 void gesture_rest(void)
 {
-    hand_set_finger_angle(FINGER_THUMB, (maxAngles[FINGER_THUMB] + minAngles[FINGER_THUMB])/2);
-    hand_set_finger_angle(FINGER_INDEX, (maxAngles[FINGER_INDEX] + minAngles[FINGER_INDEX])/2);
-    hand_set_finger_angle(FINGER_MIDDLE, (maxAngles[FINGER_MIDDLE] + minAngles[FINGER_MIDDLE])/2);
-    hand_set_finger_angle(FINGER_RING, (maxAngles[FINGER_RING] + minAngles[FINGER_RING])/2);
-    hand_set_finger_angle(FINGER_PINKY, (maxAngles[FINGER_PINKY] + minAngles[FINGER_PINKY])/2);
+    hand_set_finger_angle(JOINT_THUMB, (maxAngles[JOINT_THUMB] + minAngles[JOINT_THUMB])/2);
+    hand_set_finger_angle(JOINT_INDEX, (maxAngles[JOINT_INDEX] + minAngles[JOINT_INDEX])/2);
+    hand_set_finger_angle(JOINT_MIDDLE, (maxAngles[JOINT_MIDDLE] + minAngles[JOINT_MIDDLE])/2);
+    hand_set_finger_angle(JOINT_RING, (maxAngles[JOINT_RING] + minAngles[JOINT_RING])/2);
+    hand_set_finger_angle(JOINT_PINKY, (maxAngles[JOINT_PINKY] + minAngles[JOINT_PINKY])/2);
 }
 
 /*******************************************************************************
@@ -130,10 +134,10 @@ void gesture_rest(void)
 
 void gestures_demo_fingers(uint32_t delay_ms)
 {
-    for (int finger = 0; finger < FINGER_COUNT; finger++) {
-        hand_flex_finger((finger_t)finger);
+    for (int finger = 0; finger < FINGER_JOINT_COUNT; finger++) {
+        hand_flex_finger((joint_t)finger);
         vTaskDelay(pdMS_TO_TICKS(delay_ms));
-        hand_unflex_finger((finger_t)finger);
+        hand_unflex_finger((joint_t)finger);
         vTaskDelay(pdMS_TO_TICKS(delay_ms));
     }
 }

@@ -42,6 +42,7 @@ from learning_data_collection import (
     EMGSample, EMGWindow, EMGParser, Windower,
     PromptScheduler, SessionStorage, SessionMetadata,
     EMGFeatureExtractor, EMGClassifier, PredictionSmoother, CalibrationTransform,
+    make_feature_extractor,
     LABEL_SHIFT_MS,
 )
 
@@ -3347,11 +3348,10 @@ class VisualizationPage(BasePage):
 
             self.after(0, lambda: self.status_label.configure(text="Extracting features..."))
 
-            # Extract features matching the training pipeline
-            extractor = EMGFeatureExtractor(
-                channels=HAND_CHANNELS, expanded=True,
-                cross_channel=True, bandpass=True,
-            )
+            # Extract features matching the training pipeline (ground-truth
+            # reinhard/expanded/normalize switches — was previously missing
+            # reinhard=True, silently diverging from the deployed models).
+            extractor = make_feature_extractor(channels=HAND_CHANNELS)
             X_features = extractor.extract_features_batch(X)
 
             # Apply per-session z-score normalization (matches training pipeline)

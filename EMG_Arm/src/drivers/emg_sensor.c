@@ -14,14 +14,23 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
-#include "esp_adc/adc_continuous.h"
-#include "esp_adc/adc_cali.h"
-#include "esp_adc/adc_cali_scheme.h"
 #include "esp_err.h"
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+
+#if LIVE_EMG
+#include "esp_adc/adc_continuous.h"
+#include "esp_adc/adc_cali.h"
+#include "esp_adc/adc_cali_scheme.h"
+#else
+#include "replay_data.h"
+#include "freertos/semphr.h"
+static SemaphoreHandle_t  s_replay_tick  = NULL;
+static esp_timer_handle_t s_replay_timer = NULL;
+#endif
+
 
 // --- ADC DMA constants ---
 // Total sample rate: 4 channels × 1 kHz = 4 kHz
@@ -34,9 +43,10 @@
 #define SAMPLE_QUEUE_DEPTH        32
 
 // --- Static handles ---
+static QueueHandle_t           s_sample_queue = NULL;
+#if LIVE_EMG
 static adc_continuous_handle_t s_adc_handle   = NULL;
 static adc_cali_handle_t       s_cali_handle  = NULL;
-static QueueHandle_t           s_sample_queue = NULL;
 
 // Channel mapping (ADC1, GPIO 2/3/9/10)
 static const adc_channel_t s_channels[EMG_NUM_CHANNELS] = {
@@ -121,11 +131,36 @@ static void adc_sampling_task(void *arg) {
     }
 }
 
+#else
+static void replay_timer_cb(void *arg) {
+    BaseType_t woken = pdFALSE;
+    xSemaphoreGiveFromISR(s_replay_tick, &woken);
+    portYIELD_FROM_ISR(woken);  
+}
+
+static void replay_sampling_task(void *arg) {
+    uint32_t i = 0;
+    while (1) {
+        xSemaphoreTake(s_replay_tick, portMAX_DELAY);
+        emg_sample_t s;
+        s.timestamp_ms = emg_sensor_get_timestamp_ms();
+        for (int c = 0; c < EMG_NUM_CHANNELS; c++)
+            s.channels[c] = replay_samples[i][c];
+        xQueueSend(s_sample_queue, &s, portMAX_DELAY);
+        i = (i + 1) % REPLAY_NUM_SAMPLES;
+    }
+}
+
+#endif
 /*******************************************************************************
  * Public Functions
  ******************************************************************************/
 
 void emg_sensor_init(void) {
+    // 0. Create sample queue (assembled complete sets land here)
+    s_sample_queue = xQueueCreate(SAMPLE_QUEUE_DEPTH, sizeof(emg_sample_t));
+    assert(s_sample_queue != NULL);
+#if LIVE_EMG
     // 1. Curve-fitting calibration (same scheme as before)
     adc_cali_curve_fitting_config_t cali_cfg = {
         .unit_id  = ADC_UNIT_1,
@@ -161,13 +196,17 @@ void emg_sensor_init(void) {
     // 4. Start DMA acquisition
     ESP_ERROR_CHECK(adc_continuous_start(s_adc_handle));
 
-    // 5. Create sample queue (assembled complete sets land here)
-    s_sample_queue = xQueueCreate(SAMPLE_QUEUE_DEPTH, sizeof(emg_sample_t));
-    assert(s_sample_queue != NULL);
-
-    // 6. Launch sampling task pinned to Core 0
+    // 5. Launch sampling task pinned to Core 0
     xTaskCreatePinnedToCore(adc_sampling_task, "adc_sample", 4096, NULL, 6, NULL, 0);
+#else
+    s_replay_tick = xSemaphoreCreateBinary();
+    esp_timer_create_args_t ta = { .callback = replay_timer_cb, .name = "replay_tick" };
+    esp_timer_create(&ta, &s_replay_timer);
+    esp_timer_start_periodic(s_replay_timer, 1000);
+    xTaskCreatePinnedToCore(replay_sampling_task, "replay_sample", 4096, NULL, 6, NULL, 0);
+#endif
 }
+
 
 void emg_sensor_read(emg_sample_t *sample) {
     // Block until a complete 4-channel sample set arrives from the DMA task.

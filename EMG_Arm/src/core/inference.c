@@ -193,14 +193,18 @@ static void compute_features_expanded(float *features_out) {
       sig[i] -= mean;
       sq_sum += sig[i] * sig[i];
     }
+    float sig_mean = 0.0f;  /* mean variance is taken about; exactly 0 after DC removal */
     /* Change 4 — Reinhard tone-mapping: 64·x / (32 + |x|) */
 #if MODEL_USE_REINHARD
     sq_sum = 0.0f;
+    float sig_sum = 0.0f;
     for (int i = 0; i < INFERENCE_WINDOW_SIZE; i++) {
       float x = sig[i];
       sig[i] = 64.0f * x / (32.0f + fabsf(x));
-      sq_sum += sig[i] * sig[i];
+      sq_sum  += sig[i] * sig[i];
+      sig_sum += sig[i];
     }
+    sig_mean = sig_sum / INFERENCE_WINDOW_SIZE;  /* Reinhard leaves a small nonzero mean */
 #endif
 
     float rms = sqrtf(sq_sum / INFERENCE_WINDOW_SIZE);
@@ -219,7 +223,8 @@ static void compute_features_expanded(float *features_out) {
       iemg += a;
     }
     mav /= INFERENCE_WINDOW_SIZE;
-    float var_val = sq_sum / INFERENCE_WINDOW_SIZE;  /* variance (mean already 0) */
+    /* True variance — matches Python np.var (mean-square minus mean²). */
+    float var_val = sq_sum / INFERENCE_WINDOW_SIZE - sig_mean * sig_mean;
 
     for (int i = 0; i < INFERENCE_WINDOW_SIZE - 1; i++) {
       float diff  = sig[i+1] - sig[i];
@@ -262,34 +267,36 @@ static void compute_features_expanded(float *features_out) {
 
     float total_power = 1e-10f;
     const float freq_step = (float)EMG_SAMPLE_RATE_HZ / FFT_N;
-    float pwr[FFT_N / 2];
-    for (int k = 0; k < FFT_N / 2; k++) {
+    /* numpy rfft(signal, n=FFT_N) returns FFT_N/2 + 1 bins (DC..Nyquist) — match
+     * the bin count exactly so total power, MNF, MDF, MNP and band powers agree. */
+    float pwr[FFT_N / 2 + 1];
+    for (int k = 0; k <= FFT_N / 2; k++) {
       float re = s_fft_buf[2*k], im = s_fft_buf[2*k + 1];
       pwr[k] = re*re + im*im;
       total_power += pwr[k];
     }
 
     float mnf = 0.0f;
-    for (int k = 0; k < FFT_N / 2; k++) mnf += k * freq_step * pwr[k];
+    for (int k = 0; k <= FFT_N / 2; k++) mnf += k * freq_step * pwr[k];
     mnf /= total_power;
 
     float cumsum = 0.0f, half = total_power / 2.0f;
-    int mdf_k = FFT_N / 2 - 1;
-    for (int k = 0; k < FFT_N / 2; k++) {
+    int mdf_k = FFT_N / 2;
+    for (int k = 0; k <= FFT_N / 2; k++) {
       cumsum += pwr[k];
       if (cumsum >= half) { mdf_k = k; break; }
     }
     float mdf = mdf_k * freq_step;
 
     int pkf_k = 0;
-    for (int k = 1; k < FFT_N / 2; k++) {
+    for (int k = 1; k <= FFT_N / 2; k++) {
       if (pwr[k] > pwr[pkf_k]) pkf_k = k;
     }
     float pkf = pkf_k * freq_step;
-    float mnp = total_power / (FFT_N / 2);
+    float mnp = total_power / (FFT_N / 2 + 1);
 
     float bp0 = 0, bp1 = 0, bp2 = 0, bp3 = 0;
-    for (int k = 0; k < FFT_N / 2; k++) {
+    for (int k = 0; k <= FFT_N / 2; k++) {
       float f = k * freq_step;
       if      (f >= 20.f  && f < 80.f ) bp0 += pwr[k];
       else if (f >= 80.f  && f < 150.f) bp1 += pwr[k];

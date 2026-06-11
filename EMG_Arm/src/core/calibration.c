@@ -4,6 +4,7 @@
  */
 
 #include "calibration.h"
+#include "model_weights.h"   /* MODEL_FEAT_STD / MODEL_HAS_TRAIN_STD (sigma_train) */
 #include "nvs_flash.h"
 #include "nvs.h"
 #include <math.h>
@@ -67,6 +68,47 @@ void calibration_apply(float *feat) {
     }
 }
 
+/**
+ * @brief Reconcile the calibration scale with the model's training scale.
+ *
+ * The models expect features in (x - mu) / sigma_train space, where sigma_train
+ * is the across-gesture std measured at training time. REST-only calibration
+ * produces a std vector that is much smaller, so dividing by it inflates
+ * calibrated features and saturates the LDA/MLP softmax (the dominant cause of
+ * collapsed predictions). The REST mean is still used as the per-session offset
+ * to track electrode-placement drift; only the scale is corrected here.
+ *
+ * If the header was exported with sigma_train (MODEL_HAS_TRAIN_STD), the exact
+ * training std is used. Otherwise we fall back to flooring the REST std relative
+ * to the across-feature mean so near-constant features can't be over-amplified.
+ *
+ * @param std    Per-feature std vector (modified in place).
+ * @param n_feat Number of features.
+ */
+static void calibration_set_train_scale(float *std, int n_feat) {
+    if (n_feat <= 0) return;
+
+#if defined(MODEL_HAS_TRAIN_STD) && MODEL_HAS_TRAIN_STD
+    int n = (n_feat < MODEL_NUM_FEATURES) ? n_feat : MODEL_NUM_FEATURES;
+    for (int f = 0; f < n; f++) {
+        if (MODEL_FEAT_STD[f] > 1e-6f) {
+            std[f] = MODEL_FEAT_STD[f];
+        }
+    }
+#else
+    /* No baked training std yet — re-export model_weights.h (export_to_header)
+     * to enable the exact path. Until then, floor the REST std at a fraction of
+     * the across-feature mean std to bound feature inflation. */
+    float sum = 0.0f;
+    for (int f = 0; f < n_feat; f++) sum += std[f];
+    float floor_val = 0.25f * (sum / n_feat);
+    if (floor_val < 1e-6f) floor_val = 1e-6f;
+    for (int f = 0; f < n_feat; f++) {
+        if (std[f] < floor_val) std[f] = floor_val;
+    }
+#endif
+}
+
 bool calibration_update(const float *X_flat, int n_windows, int n_feat) {
     if (n_windows < 10 || n_feat <= 0 || n_feat > CALIB_MAX_FEATURES) {
         printf("[Calib] calibration_update: invalid args (%d windows, %d features)\n",
@@ -99,6 +141,10 @@ bool calibration_update(const float *X_flat, int n_windows, int n_feat) {
         float var = s_std[f] / n_windows;
         s_std[f]  = (var > 1e-12f) ? sqrtf(var) : 1e-6f;
     }
+
+    /* Scale calibrated features into the model's training space (prevents the
+     * softmax-saturation failure mode). See calibration_set_train_scale(). */
+    calibration_set_train_scale(s_std, n_feat);
 
     /* Persist to NVS */
     nvs_handle_t h;

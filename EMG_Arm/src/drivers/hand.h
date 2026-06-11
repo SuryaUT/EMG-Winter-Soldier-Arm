@@ -13,8 +13,11 @@
 
 #include "config/config.h"
 
-extern float maxAngles[];
-extern float minAngles[];
+/* Joints managed by this driver: thumb through wrist (excludes bicep). */
+#define FINGER_JOINT_COUNT  (JOINT_PINKY + 1)
+
+extern float maxAngles[FINGER_JOINT_COUNT + 1];
+extern float minAngles[FINGER_JOINT_COUNT + 1];
 /*******************************************************************************
  * Public Functions
  ******************************************************************************/
@@ -31,14 +34,14 @@ void hand_init(void);
  *
  * @param finger Which finger to flex
  */
-void hand_flex_finger(finger_t finger);
+void hand_flex_finger(joint_t finger);
 
 /**
  * @brief Unflex a finger (extend/open it).
  *
  * @param finger Which finger to unflex
  */
-void hand_unflex_finger(finger_t finger);
+void hand_unflex_finger(joint_t finger);
 
 /**
  * @brief Set a finger to a specific angle.
@@ -46,7 +49,15 @@ void hand_unflex_finger(finger_t finger);
  * @param finger  Which finger to move
  * @param degrees Angle (0 = extended, 180 = fully flexed)
  */
-void hand_set_finger_angle(finger_t finger, float degrees);
+void hand_set_finger_angle(joint_t finger, float degrees);
+
+/**
+ * @brief Set a finger servo to a specific duty cycle.
+ *
+ * @param finger  Which finger to move
+ * @param duty Duty cycle in ticks
+ */
+void hand_set_finger_duty(joint_t finger, float duty);
 
 /**
  * @brief Flex all fingers at once.

@@ -446,8 +446,7 @@ static void run_inference_loop(void) {
         /* Model C: int8 MLP — returns class index + confidence.
          * Spread confidence as soft one-hot for averaging. */
         float mlp_conf = 0.0f;
-        int mlp_class = inference_mlp_predict(features, MODEL_NUM_FEATURES,
-                                              &mlp_conf);
+        int mlp_class = inference_mlp_predict(features, MODEL_NUM_FEATURES, &mlp_conf);
         float remainder = (1.0f - mlp_conf) / (MODEL_NUM_CLASSES - 1);
         for (int c = 0; c < MODEL_NUM_CLASSES; c++)
           avg_proba[c] += (c == mlp_class) ? mlp_conf : remainder;
@@ -578,7 +577,6 @@ static void run_standalone_loop(void) {
         float inv_n = 1.0f / n_models;
         for (int c = 0; c < MODEL_NUM_CLASSES; c++)
           avg_proba[c] *= inv_n;
-
         float confidence = 0.0f;
         int gesture_idx = vote_postprocess(avg_proba, &confidence);
 
@@ -590,8 +588,9 @@ static void run_standalone_loop(void) {
           (void)bicep;
 
           if (gesture_idx != last_gesture) {
-            printf("{\"gesture\":\"%s\",\"conf\":%.2f}\n",
-                   inference_get_class_name(gesture_idx), confidence);
+            printf("{\"gesture\":\"%s\",\"conf\":%.2f}\n", inference_get_class_name(gesture_idx), confidence);
+            for (int c = 0; c < MODEL_NUM_CLASSES; c++)
+              printf("%s:%.2f\n", inference_get_class_name(c), avg_proba[c]);
             last_gesture = gesture_idx;
           }
         }
@@ -612,14 +611,19 @@ static void run_standalone_loop(void) {
  * Send {"cmd": "calibrate"} from the host to trigger.
  */
 static void run_calibration(void) {
-  #define CALIB_DURATION_SAMPLES 3000  /* 3 seconds at 1 kHz */
+#if LIVE_EMG
+  #define CALIB_DURATION_SAMPLES 5000  /* 3 seconds at 1 kHz */
+#else
+  #define CALIB_DURATION_SAMPLES 2000
+#endif
   #define CALIB_MAX_WINDOWS \
-      ((CALIB_DURATION_SAMPLES - INFERENCE_WINDOW_SIZE) / INFERENCE_HOP_SIZE + 1)
+((CALIB_DURATION_SAMPLES - INFERENCE_WINDOW_SIZE) / INFERENCE_HOP_SIZE + 1)
 
-  printf("{\"status\":\"calibrating\",\"duration_ms\":3000}\n");
+  printf("{\"status\":\"calibrating\",\"duration_ms\":%d}\n", CALIB_DURATION_SAMPLES);
   fflush(stdout);
 
-  inference_init();  /* reset buffer + filter state */
+  inference_init();      /* reset buffer + filter state */
+  calibration_reset();   /* collect RAW features — don't z-score with stale stats */
 
   float *feat_matrix = (float *)malloc(
       (size_t)CALIB_MAX_WINDOWS * MODEL_NUM_FEATURES * sizeof(float));
@@ -706,6 +710,7 @@ void appConnector() {
  ******************************************************************************/
 
 void app_main(void) {
+  vTaskDelay(pdMS_TO_TICKS(3000));  /* Wait for monitor to connect after upload */
   printf("\n");
   printf("========================================\n");
   printf("  Bucky Arm - EMG Robotic Hand\n");
@@ -744,7 +749,7 @@ void app_main(void) {
     run_standalone_loop();  // never returns
     break;
 
-  case SERVO_CALIBRATOR:
+  case SERVO_CALIBRATOR_ANGLE:
     while (1) {
       int angle;
       printf("Enter servo angle (0-180): ");
@@ -769,58 +774,113 @@ void app_main(void) {
         continue;
 
       if (sscanf(buf, "%d", &angle) == 1) {
-        if (angle >= 0 && angle <= 180) {
-          hand_set_finger_angle(FINGER_THUMB, angle);
+        hand_set_finger_angle(JOINT_THUMB, angle);
           vTaskDelay(pdMS_TO_TICKS(1000));
-        } else {
-          printf("Invalid angle. Must be between 0 and 180.\n");
-        }
       } else {
         printf("Invalid input.\n");
       }
     }
     break;
 
-    case GESTURE_TESTER:
-      while (1) {
-        fflush(stdout);
+  case SERVO_CALIBRATOR_DUTY:
+    while (1) {
+      int duty;
+      printf("Enter servo duty: ");
+      fflush(stdout);
 
+      // Read a line manually, yielding while waiting for UART input
+      char buf[16];
+      int idx = 0;
+      while (idx < (int)sizeof(buf) - 1) {
         int ch = getchar();
-
         if (ch == EOF) {
           vTaskDelay(pdMS_TO_TICKS(10));
           continue;
         }
+        if (ch == '\n' || ch == '\r')
+          break;
+        buf[idx++] = (char)ch;
+      }
+      buf[idx] = '\0';
 
-        if (ch == '\n' || ch == '\r') {
-          continue;
-        }
+      if (idx == 0)
+        continue;
 
-        gesture_t gesture = GESTURE_NONE;
+      if (sscanf(buf, "%d", &duty) == 1) {
+        hand_set_finger_duty(JOINT_THUMB, duty);
+          vTaskDelay(pdMS_TO_TICKS(1000));
+      } else {
+        printf("Invalid input.\n");
+      }
+    }
+    break;
 
-        switch (ch) {
-          case 'r': gesture = GESTURE_REST; break;
-          case 'f': gesture = GESTURE_FIST; break;
-          case 'o': gesture = GESTURE_OPEN; break;
-          case 'h': gesture = GESTURE_HOOK_EM; break;
-          case 't': gesture = GESTURE_THUMBS_UP; break;
-          default:
-            printf("Invalid gesture: %c\n", ch);
-            continue;
-        }
+  case GESTURE_TESTER:
+    while (1) {
+      fflush(stdout);
 
-        printf("Executing gesture: %s\n", gestures_get_name(gesture));
-        gestures_execute(gesture);
+      int ch = getchar();
 
-        vTaskDelay(pdMS_TO_TICKS(500));
+      if (ch == EOF) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+        continue;
       }
 
+      if (ch == '\n' || ch == '\r') {
+        continue;
+      }
+
+      gesture_t gesture = GESTURE_NONE;
+
+      switch (ch) {
+        case 'r': gesture = GESTURE_REST; break;
+        case 'f': gesture = GESTURE_FIST; break;
+        case 'o': gesture = GESTURE_OPEN; break;
+        case 'h': gesture = GESTURE_HOOK_EM; break;
+        case 't': gesture = GESTURE_THUMBS_UP; break;
+        default:
+          printf("Invalid gesture: %c\n", ch);
+          continue;
+      }
+
+      printf("Executing gesture: %s\n", gestures_get_name(gesture));
+      gestures_execute(gesture);
+
+      vTaskDelay(pdMS_TO_TICKS(500));
+    }
+
     break;
+
+  case CONTINUOUS_TEST: {
+    // Continuous rotation servo: the PWM "angle" sets speed and direction.
+    //   ~90 deg (neutral) = stopped
+    //    0 deg (SERVO_DUTY_MIN, ~1ms) = full speed one direction
+    //  180 deg (SERVO_DUTY_MAX, ~2ms) = full speed other direction
+    // Flip CONT_SERVO_CW_ANGLE to 180.0f if the servo spins the wrong way.
+    #define CONT_SERVO_FINGER    JOINT_THUMB
+    #define CONT_SERVO_CW_ANGLE  0.0f
+
+    printf("[CONTINUOUS_TEST] Driving servo clockwise at constant speed...\n");
+    printf("[CONTINUOUS_TEST] Finger: %d, Angle: %.0f\n",
+           CONT_SERVO_FINGER, CONT_SERVO_CW_ANGLE);
+
+    hand_set_finger_angle(CONT_SERVO_FINGER, CONT_SERVO_CW_ANGLE);
+
+    while (1) {
+      vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+    break;
+  }
 
   case EMG_MAIN:
     appConnector();
     break;
 
+  case REAL_MAIN:
+    run_calibration();
+    run_standalone_loop();
+    break;
+    
   default:
     printf("[ERROR] Unknown MAIN_MODE\n");
     break;

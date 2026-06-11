@@ -9,7 +9,7 @@ import numpy as np
 from pathlib import Path
 import sys
 sys.path.insert(0, str(Path(__file__).parent))
-from learning_data_collection import SessionStorage, EMGFeatureExtractor, HAND_CHANNELS
+from learning_data_collection import SessionStorage, build_training_matrix, HAND_CHANNELS
 
 try:
     import tensorflow as tf
@@ -17,23 +17,17 @@ except ImportError:
     print("ERROR: TensorFlow not installed. Run: pip install tensorflow")
     sys.exit(1)
 
-# --- Load and extract features -----------------------------------------------
+# --- Load + shared training pipeline -----------------------------------------
 storage = SessionStorage()
 X_raw, y, trial_ids, session_indices, label_names, _ = storage.load_all_for_training()
 
-extractor = EMGFeatureExtractor(channels=HAND_CHANNELS, cross_channel=True, expanded=True, reinhard=True)
-X = extractor.extract_features_batch(X_raw).astype(np.float32)
-
-# Per-session class-balanced normalization (must match EMGClassifier + train_ensemble.py)
-for sid in np.unique(session_indices):
-    mask = session_indices == sid
-    X_sess = X[mask]
-    y_sess = y[mask]
-    class_means = [X_sess[y_sess == cls].mean(axis=0) for cls in np.unique(y_sess)]
-    balanced_mean = np.mean(class_means, axis=0)
-    std = X_sess.std(axis=0)
-    std[std < 1e-12] = 1.0
-    X[mask] = (X_sess - balanced_mean) / std
+# build_training_matrix is the ONE pipeline shared with EMGClassifier.train and
+# train_ensemble.py: augment 3x -> extract (ground-truth feature switches) ->
+# per-session class-balanced z-score with REAL-only stats. Guarantees the MLP
+# trains on byte-identical inputs to the other two models.
+X, y, session_indices, trial_ids, sigma_train = build_training_matrix(
+    X_raw, y, session_indices=session_indices, trial_ids=trial_ids, augment=True)
+X = X.astype(np.float32)
 
 n_feat = X.shape[1]
 n_cls  = len(np.unique(y))
@@ -52,6 +46,10 @@ model.compile(optimizer='adam',
               loss='sparse_categorical_crossentropy',
               metrics=['accuracy'])
 model.summary()
+# Shuffle before fit: augmentation concatenates [real, aug1, aug2], so an
+# unshuffled validation_split tail would be pure-augmented and unrepresentative.
+_perm = np.random.default_rng(0).permutation(len(X))
+X, y = X[_perm], y[_perm]
 model.fit(X, y, epochs=150, batch_size=64, validation_split=0.1, verbose=1)
 
 # --- Convert to int8 TFLite --------------------------------------------------
