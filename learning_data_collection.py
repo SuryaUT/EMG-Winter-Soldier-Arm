@@ -1898,6 +1898,11 @@ class CalibrationTransform:
         self.mu_calib: Optional[np.ndarray] = None       # Class-balanced mean of calibration features (raw space)
         self.sigma_calib: Optional[np.ndarray] = None    # Global std of calibration features (raw space)
         self.sigma_train: Optional[np.ndarray] = None    # Mean per-session sigma from training (preferred scale ref)
+        # A2 calibration: raw-space offset from the rest centroid to the
+        # class-balanced training origin (mu_train - rest_centroid), averaged
+        # across sessions. Baked into firmware so live REST calibration can be
+        # corrected to the class-balanced mean the models were trained on.
+        self.rest_to_balanced_delta: Optional[np.ndarray] = None
         # Energy gate for rest detection (bypasses LDA when signal is quiet)
         self.rest_energy_threshold: Optional[float] = None
 
@@ -2068,22 +2073,40 @@ def _session_zscore(X_feat: np.ndarray, y: Optional[np.ndarray],
         real_mask = np.ones(n, dtype=bool)
     X_norm = X_feat.copy()
     session_sigmas = []
+    session_mus = []                            # per-session class-balanced origin (raw)
+    class_centroids: dict = {}                  # cls -> [per-session raw centroid, ...]
     for sid in np.unique(session_indices):
         mask = session_indices == sid
         stat_rows = mask & real_mask            # real rows of this session only
         X_stat = X_feat[stat_rows]
         if y is not None:
             y_stat = y[stat_rows]
-            class_means = [X_stat[y_stat == cls].mean(axis=0)
-                           for cls in np.unique(y_stat)]
-            mu = np.mean(class_means, axis=0)   # class-balanced origin
+            per_class = {int(cls): X_stat[y_stat == cls].mean(axis=0)
+                         for cls in np.unique(y_stat)}
+            mu = np.mean(list(per_class.values()), axis=0)   # class-balanced origin
+            for cls, c in per_class.items():
+                class_centroids.setdefault(cls, []).append(c)
         else:
             mu = X_stat.mean(axis=0)
         sigma = X_stat.std(axis=0) + 1e-8       # additive epsilon floor
         session_sigmas.append(sigma)
+        session_mus.append(mu)
         X_norm[mask] = (X_feat[mask] - mu) / sigma
     sigma_train = np.mean(session_sigmas, axis=0)
-    return X_norm, sigma_train
+
+    # Raw-space (pre-normalization) origins, averaged across sessions — same
+    # aggregation as sigma_train. Used to bake the rest->class-balanced offset
+    # delta into the firmware (A2): mu_train is the class-balanced origin the
+    # models were centered on; class_means_raw[rest] is the rest centroid the
+    # firmware's REST calibration measures. delta = mu_train - rest_centroid.
+    raw_stats = None
+    if y is not None:
+        raw_stats = {
+            'mu_train': np.mean(session_mus, axis=0),
+            'class_means_raw': {cls: np.mean(cs, axis=0)
+                                for cls, cs in class_centroids.items()},
+        }
+    return X_norm, sigma_train, raw_stats
 
 
 def build_training_matrix(X_raw: np.ndarray, y: np.ndarray,
@@ -2091,7 +2114,8 @@ def build_training_matrix(X_raw: np.ndarray, y: np.ndarray,
                           trial_ids: Optional[np.ndarray] = None,
                           augment: bool = True,
                           augment_multiplier: int = 3,
-                          feature_extractor: Optional['EMGFeatureExtractor'] = None):
+                          feature_extractor: Optional['EMGFeatureExtractor'] = None,
+                          stats_out: Optional[dict] = None):
     """SINGLE SOURCE OF TRUTH: raw EMG windows -> normalized feature matrix.
 
     Used by EMGClassifier.train, train_ensemble.py, and train_mlp_tflite.py so all
@@ -2132,7 +2156,12 @@ def build_training_matrix(X_raw: np.ndarray, y: np.ndarray,
     if session_indices is not None:
         real_mask = np.zeros(len(X_feat), dtype=bool)
         real_mask[:n_real] = True   # real rows are first (concat order guarantees it)
-        X_feat, sigma_train = _session_zscore(X_feat, y, session_indices, real_mask)
+        X_feat, sigma_train, raw_stats = _session_zscore(X_feat, y, session_indices, real_mask)
+        # Optional out-param: surface raw-space origins (mu_train / per-class
+        # centroids) to callers that bake the A2 calibration delta, without
+        # changing this function's return arity (train_ensemble/train_mlp rely on it).
+        if stats_out is not None and raw_stats is not None:
+            stats_out.update(raw_stats)
 
     return X_feat, y, session_indices, trial_ids, sigma_train
 
@@ -2184,17 +2213,30 @@ class EMGClassifier:
         byte-identical inputs.
         """
         augment = getattr(self, 'use_augmentation', True)
+        raw_stats: dict = {}
         X_features, y_aug, session_indices, trial_ids, sigma_train = build_training_matrix(
             X, y,
             session_indices=session_indices,
             trial_ids=trial_ids,
             augment=augment,
             feature_extractor=self.feature_extractor,
+            stats_out=raw_stats,
         )
         self.feature_names = self.feature_extractor.get_feature_names(X.shape[2])
         if sigma_train is not None:
             # Real-row sigma_train is the deployment scale baked into the firmware.
             self.calibration_transform.sigma_train = sigma_train
+
+        # A2: rest->class-balanced offset delta (raw feature space). Firmware adds
+        # this to the live REST-calibration mean so the serve origin matches the
+        # class-balanced training origin instead of the rest-only mean.
+        class_means_raw = raw_stats.get('class_means_raw')
+        if class_means_raw is not None and 'rest' in label_names:
+            rest_idx = label_names.index('rest')
+            if rest_idx in class_means_raw:
+                self.calibration_transform.rest_to_balanced_delta = (
+                    raw_stats['mu_train'] - class_means_raw[rest_idx]
+                )
 
         print(f"[Classifier] Feature matrix: {X_features.shape} "
               f"({'augmented 3x' if augment else 'real-only'}, "
@@ -2222,7 +2264,7 @@ class EMGClassifier:
         cross_validate, no augmentation) and build_training_matrix() can never
         drift apart. With no augmentation real_mask=None, i.e. stats use all rows.
         """
-        X_norm, sigma_train = _session_zscore(X_features, y, session_indices, real_mask=None)
+        X_norm, sigma_train, _raw_stats = _session_zscore(X_features, y, session_indices, real_mask=None)
         # Store mean per-session sigma so calibration can use the same scale reference
         self.calibration_transform.sigma_train = sigma_train
         return X_norm
@@ -2376,6 +2418,7 @@ class EMGClassifier:
             # Calibration transform training stats (used by CalibrationPage)
             'calib_class_means_train': self.calibration_transform.class_means_train,
             'calib_sigma_train': self.calibration_transform.sigma_train,
+            'calib_rest_to_balanced_delta': self.calibration_transform.rest_to_balanced_delta,
         }
 
         joblib.dump(model_data, filepath)
@@ -2563,6 +2606,30 @@ class EMGClassifier:
             c_content.append("#define MODEL_HAS_TRAIN_STD 0")
             c_content.append("")
 
+        # A2 calibration offset: rest -> class-balanced delta (raw feature space).
+        # Firmware adds this to the live REST-calibration mean so the serve origin
+        # matches the class-balanced training origin (fixes rest detection without
+        # losing electrode-placement drift adaptation). See calibration.c.
+        delta = getattr(self.calibration_transform, 'rest_to_balanced_delta', None)
+        if delta is not None and len(delta) == n_features:
+            c_content.append("/* Rest->class-balanced offset delta for calibration (A2) */")
+            c_content.append("#define MODEL_HAS_MEAN_DELTA 1")
+            c_content.append("static const float MODEL_REST_TO_BALANCED_DELTA[MODEL_NUM_FEATURES] = {")
+            line = "    "
+            for j, val in enumerate(delta):
+                line += f"{float(val):.8f}f, "
+                if (j + 1) % 8 == 0:
+                    c_content.append(line)
+                    line = "    "
+            if line.strip():
+                c_content.append(line.rstrip(", "))
+            c_content.append("};")
+            c_content.append("")
+        else:
+            c_content.append("/* rest->balanced delta unavailable at export — firmware uses REST-only mean */")
+            c_content.append("#define MODEL_HAS_MEAN_DELTA 0")
+            c_content.append("")
+
         c_content.append("#endif /* MODEL_WEIGHTS_H */")
 
         with open(filepath, 'w') as f:
@@ -2637,6 +2704,9 @@ class EMGClassifier:
             classifier.calibration_transform.has_training_stats = True
         if sigma_train is not None:
             classifier.calibration_transform.sigma_train = sigma_train
+        rest_to_balanced_delta = model_data.get('calib_rest_to_balanced_delta')
+        if rest_to_balanced_delta is not None:
+            classifier.calibration_transform.rest_to_balanced_delta = rest_to_balanced_delta
 
         print(f"[Classifier] Model loaded from: {filepath}")
         print(f"[Classifier] Labels: {classifier.label_names}")

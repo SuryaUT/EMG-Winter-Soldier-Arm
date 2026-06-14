@@ -109,6 +109,34 @@ static void calibration_set_train_scale(float *std, int n_feat) {
 #endif
 }
 
+/**
+ * @brief Correct the REST-only calibration mean toward the class-balanced
+ *        training origin (A2).
+ *
+ * Training z-scored features as (x - mu_balanced)/sigma_train, where
+ * mu_balanced is the class-balanced mean (average of per-class centroids). The
+ * on-device calibration only measures a REST clip, so its mean sits below
+ * mu_balanced — biasing every feature upward and, in particular, preventing
+ * rest from being recognized. If the header bakes the fixed offset
+ * delta = mu_balanced - rest_centroid (MODEL_REST_TO_BALANCED_DELTA, raw
+ * feature space), adding it to the live REST mean yields the class-balanced
+ * origin while still tracking today's electrode placement via the live REST mean.
+ *
+ * @param mean   Per-feature REST mean vector (modified in place).
+ * @param n_feat Number of features.
+ */
+static void calibration_apply_mean_delta(float *mean, int n_feat) {
+    if (n_feat <= 0) return;
+#if defined(MODEL_HAS_MEAN_DELTA) && MODEL_HAS_MEAN_DELTA
+    int n = (n_feat < MODEL_NUM_FEATURES) ? n_feat : MODEL_NUM_FEATURES;
+    for (int f = 0; f < n; f++) {
+        mean[f] += MODEL_REST_TO_BALANCED_DELTA[f];
+    }
+#else
+    (void)mean;
+#endif
+}
+
 bool calibration_update(const float *X_flat, int n_windows, int n_feat) {
     if (n_windows < 10 || n_feat <= 0 || n_feat > CALIB_MAX_FEATURES) {
         printf("[Calib] calibration_update: invalid args (%d windows, %d features)\n",
@@ -145,6 +173,11 @@ bool calibration_update(const float *X_flat, int n_windows, int n_feat) {
     /* Scale calibrated features into the model's training space (prevents the
      * softmax-saturation failure mode). See calibration_set_train_scale(). */
     calibration_set_train_scale(s_std, n_feat);
+
+    /* Shift the REST-only mean to the class-balanced training origin (A2) so the
+     * serve offset matches training. Done after the std computation (which needs
+     * the true REST mean) and persisted below. No-op unless MODEL_HAS_MEAN_DELTA. */
+    calibration_apply_mean_delta(s_mean, n_feat);
 
     /* Persist to NVS */
     nvs_handle_t h;

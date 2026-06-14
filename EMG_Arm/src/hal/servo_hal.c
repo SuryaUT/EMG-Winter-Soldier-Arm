@@ -126,6 +126,15 @@ void servo_hal_init(void)
 {
     i2c_bus_init();
 
+    /* No PCA9685 on the bus (e.g. servo board unplugged during a replay/
+     * inference-only test): skip servo bring-up instead of aborting. The
+     * rest of the firmware (EMG replay, inference, serial) still runs;
+     * servo_hal_set_duty() no-ops safely on the null device handle. */
+    if (s_pca_dev == NULL) {
+        ESP_LOGW(TAG, "PCA9685 not found — running without servos");
+        return;
+    }
+
     ESP_ERROR_CHECK(pca9685_write_reg(PCA9685_REG_MODE1, PCA9685_MODE1_AI));
     ESP_ERROR_CHECK(pca9685_write_reg(PCA9685_REG_MODE2, PCA9685_MODE2_OUTDRV));
     pca9685_set_pwm_freq(SERVO_PWM_FREQ_HZ);
@@ -142,6 +151,7 @@ void servo_hal_init(void)
 
 void servo_hal_set_duty(uint8_t channel, uint32_t duty)
 {
+    if (s_pca_dev == NULL) return;  /* no servo board — silently no-op */
     if (channel > 15) return;
     if (duty > 4095)  duty = 4095;
 

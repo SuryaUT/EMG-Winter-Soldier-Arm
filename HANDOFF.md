@@ -1,8 +1,65 @@
 # Bucky Arm — Inference Consistency Handoff
 
-**Last updated:** 2026-06-11
-**Branch:** `main` · last commit before this work: `9b38037 updated train/serve and python/firmware consistency`
-**Status:** Source code is fully consistent across Python / firmware / train / serve. **The deployed firmware artifacts are stale and must be regenerated before testing on-device.**
+**Last updated:** 2026-06-13
+**Branch:** `main` · consistency baseline: `9b38037 updated train/serve and python/firmware consistency`
+**Status:** Source consistent across Python / firmware / train / serve. Artifacts **regenerated** (2026-06-13) from the `updated*` sessions only. **A2 calibration fix added and validated on the flash replay.** Uncommitted working-tree changes (see Session log). Next step: real-EMG/on-arm test, then drive model accuracy (fist/thumbs_up/hook_em confusion).
+
+---
+
+## Session log — 2026-06-13 (replay test + A2 calibration)
+
+Goal of the session: run the flash-backed **replay test** (recorded EMG streamed through the real inference path, no live sensors) to validate the regenerated models, then close the biggest accuracy gap.
+
+### Decisions made
+- **Train on `updated*` only.** The 3 newer `new_system_*` sessions were moved out of `collected_data/` → `extra_data/` so all three models train on the 15 Feb-14 `updated*` sessions only — the same distribution as the replay session `updated010`. (`load_all_for_training()` scans `collected_data/`, so moving files is the selection mechanism.)
+- **Replay test needs no servo board.** A missing PCA9685 should degrade gracefully, not brick the firmware (it was aborting in `servo_hal_init`). Fixed so inference runs headless.
+- **Close the calibration-mean gap with A2 (bake a delta), not B (multi-gesture on-device calib).** A2 is the minimal change, works immediately on replay, and keeps electrode-drift adaptation. B remains the better *live* answer if A2 proves insufficient on real EMG. (See §6 / "Calibration mean" residual.)
+- **Do NOT adopt micromlgen.** Verified empirically: `micromlgen` does **not** support `LinearDiscriminantAnalysis` (`port()` rejects it — supported list is SVC/RVC/SEFR/trees/forests/GaussianNB/LogisticRegression/PCA/LinearRegression/XGB). It also only ports a bare model, not our feature extraction / calibration / ensemble / MLP / voting. The hand-rolled `export_to_header` path stays.
+
+### Changes made (working tree — not yet committed)
+- **`learning_data_collection.py`**
+  - `_session_zscore` now also returns `raw_stats` = raw-space `mu_train` (class-balanced origin) + per-class centroids, averaged across sessions (same aggregation as `sigma_train`). Return arity changed 2→3; both internal callers updated.
+  - `build_training_matrix` gained optional `stats_out` dict (filled with `raw_stats`). **Public return arity unchanged (5-tuple)** so `train_ensemble.py` / `train_mlp_tflite.py` are untouched.
+  - `EMGClassifier.train` computes `rest_to_balanced_delta = mu_train − rest_centroid` and stores it on `calibration_transform`; `save()`/`load()` persist it.
+  - `export_to_header` emits `#define MODEL_HAS_MEAN_DELTA 1` + `MODEL_REST_TO_BALANCED_DELTA[69]` (mirrors the `MODEL_FEAT_STD` block).
+  - `CalibrationTransform.__init__` gained `rest_to_balanced_delta`.
+- **`EMG_Arm/src/core/calibration.c`** — new `calibration_apply_mean_delta()` adds the baked delta to the live REST mean (after the std step, so the fallback std stays correct). Serve origin becomes `rest_mean_live + delta ≈ class-balanced mean`, matching training while still tracking placement.
+- **`EMG_Arm/src/hal/servo_hal.c`** — `servo_hal_init()` returns gracefully (warns) if no PCA9685 is on the bus instead of `ESP_ERROR_CHECK` abort; `servo_hal_set_duty()` no-ops on a null device handle (no warning spam). Lets the replay/inference path run with no servo board.
+- **`EMG_Arm/src/app/main.c`** — `run_standalone_loop` transition print now includes `"t_ms"` (the replay sample's `timestamp_ms`) for aligning predictions to the recording timeline.
+- **Regenerated artifacts (2026-06-13):** `model_weights.h` (LDA + `sigma_train` + A2 delta), `model_weights_ensemble.h`, `emg_model_data.cc` — all from the 15 `updated*` sessions. Note: A2 only affects `model_weights.h` (calibration is shared), so re-exporting the header is enough to add A2; the ensemble/MLP did **not** need retraining for it.
+
+### Replay test result
+Mode: `MAIN_MODE = REAL_MAIN`, `LIVE_EMG = 0`, replay = `updated010`. Timeline anchor: `t_ms ≈ recording time` (offset ≈ 0, confirmed by confident predictions landing in their true windows). Calibration consumes the first ~2 s (initial rest).
+
+- **Pre-A2:** pipeline alive, no class collapse (confirms the `sigma_train` fix), confident predictions mostly correct (fist 0.99) — **but `rest` was essentially never emitted** between gestures (reject-gate held the previous gesture), and fist↔thumbs_up confusion was heavy.
+- **Post-A2:** **`rest` is back and confident** (0.78–0.88, landing dead-center in the real rest periods), peak confidences rose across all classes (open 0.95, thumbs_up 0.93, fist 0.99), and the rest→gesture→rest cadence now tracks the recording. This is A2 working as designed.
+- **Remaining errors are model confusability, not calibration:** fist ↔ hook_em and fist ↔ thumbs_up flicker (these flexor patterns overlap; per-window CV is only ~54–58%). Plus expected EMA-lag blips at gesture boundaries.
+
+### Honest caveats
+- Per-gesture accuracy percentages discussed in chat were **estimates** (CV number + eyeballed transition log), not measured. The serial log is partial (~50 s of the 75 s loop) and only logs *transitions* (biased toward flicker). For real numbers, finish `compare_relay.py` (see below).
+- **A2 is unverified on truly new EMG.** `updated010` is in the training set, so live rest ≈ training rest by construction. A2 assumes the rest→class-balanced *offset shape* is placement-invariant; the first real on-arm session is the actual test. If accuracy drops or rest drifts back, switch to **Solution B** (multi-gesture on-device calibration).
+
+### What `compare_relay.py` is (and was for)
+`models/compare_relay.py` is an **unfinished replay-validation harness**, not part of the runtime. Git history: created empty in `9b38037`, stub body added in `067b313` ("more consistency updates", 2026-06-11) during the consistency work. It builds the **expected** ground-truth gesture sequence at each firmware hop position (start at `CALIB_SAMPLES`=2000, `HOP`=25, `WINDOW`=150) by mapping each hop to the nearest labeled HDF5 window — the intent being to **diff expected vs. the firmware's actual serial output** (or, better, vs. an offline re-run of the pipeline) to get per-gesture accuracy + a confusion matrix.
+
+It was never completed: it stops after building `expected` (no prediction, no comparison, no scoring). It also has a **labeling bug** — it indexes `gestures[trial_ids[nearest]]`, but `trial_ids` are trial identifiers (0–449), not gesture-class indices, and `gestures` (4 entries) omits `rest`; the correct label source is `windows/labels` (the `|S10` strings). To finish it: replace the label lookup with `windows/labels`, then run `updated010`'s `raw_samples` through the same extractor → calibration (`sigma_train` + A2 delta) → LDA+ensemble+MLP average → `PredictionSmoother`, and score against `expected`. That replaces the chat estimates with measured numbers.
+
+### Next steps (resume here — 2026-06-14)
+
+**Plan agreed:** rewrite `models/compare_relay.py` (a temp/stub) into a **proper offline simulator** — keep its one good bone (the hop→ground-truth mapping), fix the label bug, and build out the scoring. Goal: replace the eyeballed accuracy estimates with a measured **per-gesture accuracy + confusion matrix** for `updated010`, and confirm whether fist↔thumbs_up vs fist↔hook_em is the dominant confusion.
+
+**The simulator only has value if it faithfully matches the firmware.** Four fidelity points are make-or-break (get any wrong → authoritative-looking but false numbers):
+1. **Continuous filtering** over the entire `raw_samples` stream, then window — NOT `extract_features_batch` (which resets the filter per window; the documented "filter warmup" residual). Firmware filters with persistent state across hops.
+2. **Firmware calibration, not laptop calibration.** Use `rest_mean(first 2000 samples) + sigma_train + A2 delta`. Do NOT reuse `emg_gui` (class-balanced `mu_calib`) or `live_predict` (has rest-mean+sigma_train but **no A2 delta**). Re-implement firmware calibration explicitly.
+3. **INT8 `.tflite` MLP**, not the float `.npz`/Keras weights — the firmware runs the quantized model (`emg_model_data.cc`); float ≠ int8. Run the actual `.tflite` via the TFLite interpreter, or explicitly mark it an approximation.
+4. **Smoother params byte-identical**: `PredictionSmoother` EMA 0.7 / reject 0.4 / vote 5 / debounce 3 == firmware `vote_postprocess`.
+
+**Trust mechanism (recommended — "Option A"):** validate the sim against the real device. Add a "log every hop" debug mode to `run_standalone_loop` (emit predicted class + `t_ms` every hop, not just on change), capture one clean full replay pass, and confirm the sim's per-hop output matches the device's. Agreement ⇒ the confusion matrix is *proven* faithful; disagreement ⇒ tells us which of the 4 points bit us. (Option B = sim only, careful but unproven — rejected for the "how accurate is the arm" question.) **Pending a go-ahead on A vs B before writing.**
+
+**Other open follow-ups:**
+- **Commit the working tree.** All session changes (Python + firmware + regenerated artifacts) are uncommitted on `main`. Branch first per repo convention, then commit.
+- **Real-EMG / on-arm test** — the true test of A2 (replay is in-distribution by construction). If accuracy drops or rest drifts back, switch to **Solution B** (multi-gesture on-device calibration). To go live: `LIVE_EMG 1` in `drivers/emg_sensor.h`, wire up PCA9685 (check pull-ups — it currently boots without servos due to the new guard) + sensors.
+- **Model accuracy** is now the bottleneck (not calibration): fist/thumbs_up/hook_em confusability at ~54–58% per-window CV. Levers: more/better data for those 3, better-separating features, or per-class confidence thresholds.
 
 ---
 

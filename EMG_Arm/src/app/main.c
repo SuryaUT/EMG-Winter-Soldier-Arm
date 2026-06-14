@@ -588,7 +588,9 @@ static void run_standalone_loop(void) {
           (void)bicep;
 
           if (gesture_idx != last_gesture) {
-            printf("{\"gesture\":\"%s\",\"conf\":%.2f}\n", inference_get_class_name(gesture_idx), confidence);
+            printf("{\"gesture\":\"%s\",\"conf\":%.2f,\"t_ms\":%lu}\n",
+                   inference_get_class_name(gesture_idx), confidence,
+                   (unsigned long)sample.timestamp_ms);
             for (int c = 0; c < MODEL_NUM_CLASSES; c++)
               printf("%s:%.2f\n", inference_get_class_name(c), avg_proba[c]);
             last_gesture = gesture_idx;
