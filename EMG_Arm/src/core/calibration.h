@@ -43,6 +43,18 @@ bool calibration_init(void);
 void calibration_apply(float *feat);
 
 /**
+ * @brief Copy out the active calibration mean/std vectors.
+ *
+ * Lets a caller reconstruct raw features from calibrated ones
+ * (raw_i = calibrated_i * std_i + mean_i). Used by the PARITY_DUMP harness.
+ *
+ * @param mean_out Buffer of ≥ n_feat floats, or NULL to skip.
+ * @param std_out  Buffer of ≥ n_feat floats, or NULL to skip.
+ * @return n_feat, or 0 if calibration is not valid.
+ */
+int calibration_get_stats(float *mean_out, float *std_out);
+
+/**
  * @brief Compute and persist calibration statistics from REST EMG windows.
  *
  * Computes per-feature mean and std over n_windows windows, stores to NVS.

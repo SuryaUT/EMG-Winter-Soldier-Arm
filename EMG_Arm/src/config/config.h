@@ -15,9 +15,14 @@
  * Main Modes
  ******************************************************************************/
 
-enum {REAL_MAIN, EMG_MAIN, SERVO_CALIBRATOR_ANGLE, SERVO_CALIBRATOR_DUTY, GESTURE_TESTER, EMG_STANDALONE, CONTINUOUS_TEST};
+enum {REAL_MAIN, EMG_MAIN, SERVO_CALIBRATOR_ANGLE, SERVO_CALIBRATOR_DUTY, GESTURE_TESTER, EMG_STANDALONE, CONTINUOUS_TEST, PARITY_DUMP};
 
 #define MAIN_MODE REAL_MAIN
+
+/* PARITY_DUMP: number of inference hops to dump.
+ * The rep                                                                                                                                         ay is 75564 samples at hop 25 -> ~3022 hops. 3100 covers the whole
+ * session, so the dump yields a full-session on-device accuracy figure. */
+#define PARITY_DUMP_HOPS 3100
 
 /*******************************************************************************
  * I2C Configuration (PCA9685 servo controller bus)

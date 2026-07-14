@@ -30,6 +30,14 @@
 #include "drivers/emg_sensor.h"
 #include "drivers/hand.h"
 
+#if MAIN_MODE == PARITY_DUMP
+#if LIVE_EMG
+#error "PARITY_DUMP requires LIVE_EMG 0 (replay data) in drivers/emg_sensor.h"
+#endif
+#include "drivers/replay_data.h"
+#include <stdlib.h>
+#endif
+
 /*******************************************************************************
  * Constants
  ******************************************************************************/
@@ -292,38 +300,41 @@ static void stream_emg_data(void) {
  * probability output from all enabled models (single LDA, ensemble, MLP).
  ******************************************************************************/
 
+/* Retuned 2026-07-13. Previously: EMA + a 5-wide majority vote + a 3-hit debounce.
+ * The EMA already smooths, so the vote and debounce were double-smoothing — they
+ * added latency without buying stability, and the output still flickered at 1.8x
+ * the true gesture-change rate.
+ *
+ * Replaced with EMA + HYSTERESIS: it takes a lot of confidence to ADOPT a new
+ * gesture (ENTER) but very little to KEEP the current one (HOLD). That asymmetry
+ * is what actually suppresses flicker.
+ *
+ * Measured on 4 held-out sessions (96 true gesture changes), steady-state accuracy
+ * vs. output switches:
+ *   old  EMA+vote5+debounce3 : 85.48%, 175 switches (1.82x)
+ *   new  EMA+hysteresis      : 87.25%, 115 switches (1.20x)
+ * Better accuracy AND ~35% less flicker. */
 #define VOTE_EMA_ALPHA      0.70f
-#define VOTE_CONF_THRESHOLD 0.40f
-#define VOTE_WINDOW_SIZE    5
-#define VOTE_DEBOUNCE_COUNT 3
+#define VOTE_ENTER_THRESHOLD 0.70f  /* confidence required to SWITCH to a new gesture */
+#define VOTE_HOLD_THRESHOLD  0.25f  /* below this we hold the last output, unconditionally */
 
 static float vote_smoothed[MODEL_NUM_CLASSES];
-static int   vote_history[VOTE_WINDOW_SIZE];
-static int   vote_head = 0;
 static int   vote_current_output = -1;
-static int   vote_pending_output = -1;
-static int   vote_pending_count  = 0;
 
 static void vote_init(void) {
   for (int c = 0; c < MODEL_NUM_CLASSES; c++)
     vote_smoothed[c] = 1.0f / MODEL_NUM_CLASSES;
-  for (int i = 0; i < VOTE_WINDOW_SIZE; i++)
-    vote_history[i] = -1;
-  vote_head = 0;
   vote_current_output = -1;
-  vote_pending_output = -1;
-  vote_pending_count  = 0;
 }
 
 /**
- * @brief Apply EMA + majority vote + debounce to averaged probabilities.
+ * @brief Apply EMA + hysteresis to averaged probabilities.
  *
  * @param avg_proba  Averaged probability vector from all models.
  * @param confidence Output: smoothed confidence of the final winner.
- * @return Final gesture class index (-1 if uncertain).
+ * @return Final gesture class index (-1 before the first confident lock).
  */
 static int vote_postprocess(const float *avg_proba, float *confidence) {
-  /* EMA smoothing */
   float max_smooth = 0.0f;
   int winner = 0;
   for (int c = 0; c < MODEL_NUM_CLASSES; c++) {
@@ -334,53 +345,21 @@ static int vote_postprocess(const float *avg_proba, float *confidence) {
       winner = c;
     }
   }
-
-  /* Confidence rejection */
-  if (max_smooth < VOTE_CONF_THRESHOLD) {
-    *confidence = max_smooth;
-    return vote_current_output;
-  }
-
   *confidence = max_smooth;
 
-  /* Majority vote */
-  vote_history[vote_head] = winner;
-  vote_head = (vote_head + 1) % VOTE_WINDOW_SIZE;
+  /* Too unsure to say anything — keep doing whatever we were doing. */
+  if (max_smooth < VOTE_HOLD_THRESHOLD)
+    return vote_current_output;
 
-  int counts[MODEL_NUM_CLASSES];
-  memset(counts, 0, sizeof(counts));
-  for (int i = 0; i < VOTE_WINDOW_SIZE; i++) {
-    if (vote_history[i] >= 0)
-      counts[vote_history[i]]++;
-  }
-  int majority = 0, majority_cnt = 0;
-  for (int c = 0; c < MODEL_NUM_CLASSES; c++) {
-    if (counts[c] > majority_cnt) {
-      majority_cnt = counts[c];
-      majority = c;
-    }
-  }
+  /* Already holding this gesture: no threshold to clear, just stay. */
+  if (winner == vote_current_output)
+    return vote_current_output;
 
-  /* Debounce */
-  int final_out = (vote_current_output >= 0) ? vote_current_output : majority;
+  /* Changing gesture is the expensive move — demand real confidence for it. */
+  if (vote_current_output < 0 || max_smooth >= VOTE_ENTER_THRESHOLD)
+    vote_current_output = winner;
 
-  if (vote_current_output < 0) {
-    vote_current_output = majority;
-    final_out = majority;
-  } else if (majority == vote_current_output) {
-    vote_pending_output = majority;
-    vote_pending_count  = 1;
-  } else if (majority == vote_pending_output) {
-    if (++vote_pending_count >= VOTE_DEBOUNCE_COUNT) {
-      vote_current_output = majority;
-      final_out = majority;
-    }
-  } else {
-    vote_pending_output = majority;
-    vote_pending_count  = 1;
-  }
-
-  return final_out;
+  return vote_current_output;
 }
 
 /**
@@ -669,6 +648,134 @@ static void run_calibration(void) {
   #undef CALIB_MAX_WINDOWS
 }
 
+#if MAIN_MODE == PARITY_DUMP
+/**
+ * @brief Train/serve parity harness (MAIN_MODE == PARITY_DUMP).
+ *
+ * Walks replay_samples[] directly — no esp_timer, no queue, no real-time pacing —
+ * so the run is fully deterministic and blocking printf cannot drop samples.
+ * Feeds the exact same input Python gets from the source HDF5, then dumps every
+ * quantity needed to diff the two implementations feature-by-feature.
+ *
+ * Output is line-oriented and machine-parsable; see tools/parity_compare.py.
+ */
+static void run_parity_dump(void) {
+  const int CALIB_SAMPLES = 2000; /* mirrors run_calibration() in replay mode */
+  const int CALIB_MAX_WIN =
+      (CALIB_SAMPLES - INFERENCE_WINDOW_SIZE) / INFERENCE_HOP_SIZE + 1;
+
+  /* ---- Phase 1: calibrate off the replay's leading rest period ---- */
+  inference_init();
+  calibration_reset(); /* collect RAW features */
+
+  float *feat_matrix =
+      (float *)malloc((size_t)CALIB_MAX_WIN * MODEL_NUM_FEATURES * sizeof(float));
+  if (!feat_matrix) {
+    printf("#error malloc failed\n");
+    return;
+  }
+
+  int win = 0, stride = 0;
+  for (int s = 0; s < CALIB_SAMPLES && s < REPLAY_NUM_SAMPLES; s++) {
+    uint16_t ch[NUM_CHANNELS];
+    for (int c = 0; c < NUM_CHANNELS; c++)
+      ch[c] = replay_samples[s][c];
+    if (inference_add_sample(ch)) {
+      if (++stride >= INFERENCE_HOP_SIZE) {
+        stride = 0;
+        if (win < CALIB_MAX_WIN) {
+          inference_extract_features(feat_matrix + win * MODEL_NUM_FEATURES);
+          win++;
+        }
+      }
+    }
+  }
+  calibration_update(feat_matrix, win, MODEL_NUM_FEATURES);
+  free(feat_matrix);
+
+  float cmean[MODEL_NUM_FEATURES], cstd[MODEL_NUM_FEATURES];
+  int nf = calibration_get_stats(cmean, cstd);
+
+#if MODEL_USE_ENSEMBLE
+  inference_ensemble_init();
+#endif
+#if MODEL_USE_MLP
+  inference_mlp_init();
+#endif
+
+  /* The dump is deterministic, so just repeat it forever: the capture tool can
+     attach at any time and still get one complete, self-contained cycle without
+     anyone having to hit RESET with the right timing. */
+  while (1) {
+    printf("#PARITY_BEGIN\n");
+    printf("#meta n_feat=%d n_class=%d win=%d hop=%d replay_n=%d hops=%d\n",
+           MODEL_NUM_FEATURES, MODEL_NUM_CLASSES, INFERENCE_WINDOW_SIZE,
+           INFERENCE_HOP_SIZE, REPLAY_NUM_SAMPLES, PARITY_DUMP_HOPS);
+    printf("#calib_windows %d\n", win);
+    printf("#calib_valid %d\n", nf);
+
+    /* Calibration vectors: let Python reproduce calibration_apply() and verify
+       the sigma_train override + A2 mean delta landed correctly. */
+    printf("CMEAN");
+    for (int i = 0; i < nf; i++) printf(",%.9g", cmean[i]);
+    printf("\nCSTD");
+    for (int i = 0; i < nf; i++) printf(",%.9g", cstd[i]);
+    printf("\n");
+
+    /* ---- Phase 2: replay from sample 0 and dump every hop ---- */
+    inference_init(); /* reset filter state + window buffer */
+
+    int hop = 0;
+    stride = 0;
+    for (int s = 0; s < REPLAY_NUM_SAMPLES && hop < PARITY_DUMP_HOPS; s++) {
+      uint16_t ch[NUM_CHANNELS];
+      for (int c = 0; c < NUM_CHANNELS; c++)
+        ch[c] = replay_samples[s][c];
+
+      if (!inference_add_sample(ch))
+        continue;
+      if (++stride < INFERENCE_HOP_SIZE)
+        continue;
+      stride = 0;
+
+      float feat[MODEL_NUM_FEATURES];
+      inference_extract_features(feat); /* calibrated */
+
+      float p_lda[MODEL_NUM_CLASSES];
+      inference_predict_raw(feat, p_lda);
+
+      /* H,<hop>,<end_sample_idx> — end_sample_idx is the index of the LAST
+         sample in this window, so Python's window is raw[idx-149 .. idx]. */
+      printf("H,%d,%d", hop, s);
+      for (int i = 0; i < MODEL_NUM_FEATURES; i++) printf(",%.9g", feat[i]);
+      for (int c = 0; c < MODEL_NUM_CLASSES; c++)  printf(",%.9g", p_lda[c]);
+
+#if MODEL_USE_ENSEMBLE
+      float p_ens[MODEL_NUM_CLASSES];
+      inference_ensemble_predict_raw(feat, p_ens);
+      for (int c = 0; c < MODEL_NUM_CLASSES; c++) printf(",%.9g", p_ens[c]);
+#else
+      for (int c = 0; c < MODEL_NUM_CLASSES; c++) printf(",nan");
+#endif
+
+#if MODEL_USE_MLP
+      float mlp_conf = 0.0f;
+      int mlp_class = inference_mlp_predict(feat, MODEL_NUM_FEATURES, &mlp_conf);
+      printf(",%d,%.9g", mlp_class, mlp_conf);
+#else
+      printf(",-1,nan");
+#endif
+      printf("\n");
+      hop++;
+    }
+
+    printf("#PARITY_END %d\n", hop);
+    fflush(stdout);
+    vTaskDelay(pdMS_TO_TICKS(3000));
+  }
+}
+#endif /* MAIN_MODE == PARITY_DUMP */
+
 static void state_machine_loop(void) {
   command_t cmd;
   const TickType_t poll_interval = pdMS_TO_TICKS(50);
@@ -745,6 +852,12 @@ void app_main(void) {
   printf("[INIT] Done!\n\n");
 
   switch (MAIN_MODE) {
+#if MAIN_MODE == PARITY_DUMP
+  case PARITY_DUMP:
+    run_parity_dump();  // never returns
+    break;
+#endif
+
   case EMG_STANDALONE:
     // Fully autonomous: no laptop needed after this point.
     // Boots directly into the inference + arm control loop.

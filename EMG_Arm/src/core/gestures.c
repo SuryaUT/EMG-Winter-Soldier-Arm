@@ -52,10 +52,6 @@ void gestures_execute(gesture_t gesture)
     }
 }
 
-gesture_t gestures_index_to_gesture(int gesture_idx){
-    return (gesture_t) (gesture_idx + 1);
-}
-
 gesture_t parse_gesture(const char *s)
 {
     if (strcmp(s, "rest") == 0)       return GESTURE_REST;

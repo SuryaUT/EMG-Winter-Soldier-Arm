@@ -29,14 +29,6 @@ void inference_init(void);
 bool inference_add_sample(uint16_t *channels);
 
 /**
- * @brief Run inference on the current window.
- *
- * @param confidence Output pointer for confidence score (0.0 - 1.0)
- * @return Detected class index (-1 if error)
- */
-int inference_predict(float *confidence);
-
-/**
  * @brief Get the name of a class index.
  */
 const char *inference_get_class_name(int class_idx);

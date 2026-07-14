@@ -68,6 +68,13 @@ void calibration_apply(float *feat) {
     }
 }
 
+int calibration_get_stats(float *mean_out, float *std_out) {
+    if (!s_valid) return 0;
+    if (mean_out) memcpy(mean_out, s_mean, (size_t)s_n_feat * sizeof(float));
+    if (std_out)  memcpy(std_out,  s_std,  (size_t)s_n_feat * sizeof(float));
+    return s_n_feat;
+}
+
 /**
  * @brief Reconcile the calibration scale with the model's training scale.
  *

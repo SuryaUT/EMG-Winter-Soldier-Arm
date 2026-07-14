@@ -17,18 +17,6 @@
 #define FFT_N 256         /* Must match Python fft_n=256 */
 #endif
 
-// --- Constants ---
-#define SMOOTHING_FACTOR     0.7f  // EMA factor for probability (matches Python)
-#define VOTE_WINDOW          5     // Majority vote window size
-#define DEBOUNCE_COUNT       3     // Confirmations needed to change output
-// Change C: confidence rejection threshold.
-// When the peak smoothed probability stays below this, hold the last confirmed
-// output rather than outputting an uncertain prediction. Prevents false arm
-// actuations during gesture transitions, rest-to-gesture onset, and electrode lift.
-// Meta paper uses 0.35; 0.40 adds a prosthetic safety margin.
-// Tune down to 0.35 if real gestures are being incorrectly rejected.
-#define CONFIDENCE_THRESHOLD 0.40f
-
 // --- Change B: IIR Bandpass Filter (20–450 Hz, 2nd-order Butterworth @ 1 kHz) ---
 // Two cascaded biquad sections, Direct Form II Transposed.
 // Computed via scipy.signal.butter(2, [20,450], btype='bandpass', fs=1000, output='sos').
@@ -54,14 +42,6 @@ static bool     s_fft_ready = false;
 static int buffer_head = 0;
 static int samples_collected = 0;
 
-// Smoothing State
-static float smoothed_probs[MODEL_NUM_CLASSES];
-static int vote_history[VOTE_WINDOW];
-static int vote_head = 0;
-static int current_output = -1;
-static int pending_output = -1;
-static int pending_count = 0;
-
 void inference_init(void) {
   memset(window_buffer, 0, sizeof(window_buffer));
   memset(biquad_w,      0, sizeof(biquad_w));
@@ -74,18 +54,6 @@ void inference_init(void) {
     s_fft_ready = true;
   }
 #endif
-
-  // Initialize smoothing
-  for (int i = 0; i < MODEL_NUM_CLASSES; i++) {
-    smoothed_probs[i] = 1.0f / MODEL_NUM_CLASSES;
-  }
-  for (int i = 0; i < VOTE_WINDOW; i++) {
-    vote_history[i] = -1;
-  }
-  vote_head = 0;
-  current_output = -1;
-  pending_output = -1;
-  pending_count = 0;
 }
 
 bool inference_add_sample(uint16_t *channels) {
@@ -168,7 +136,10 @@ static void compute_features_expanded(float *features_out) {
 
   /* Persistent buffers for centered signals (3 ch × 150 samples) */
   static float ch_signals[HAND_NUM_CHANNELS][INFERENCE_WINDOW_SIZE];
-  static float s_fft_buf[FFT_N * 2];  /* Complex interleaved [re,im,...] */
+  /* 16-byte alignment is REQUIRED: on the ESP32-S3 dsps_fft2r_fc32 dispatches to
+   * the AES3 SIMD kernel, which silently produces a scrambled spectrum on an
+   * unaligned buffer. */
+  static float s_fft_buf[FFT_N * 2] __attribute__((aligned(16)));  /* Complex interleaved [re,im,...] */
 
   float ch_rms[HAND_NUM_CHANNELS];
   float norm_sq = 0.0f;
@@ -376,111 +347,15 @@ static void compute_features_expanded(float *features_out) {
 
 #endif  /* MODEL_EXPAND_FEATURES */
 
-static void compute_features(float *features_out) {
-  // Process forearm channels only (ch0-ch2) for hand gesture classification.
-  // The bicep channel (ch3) is excluded — it will be processed independently.
-
-  for (int ch = 0; ch < HAND_NUM_CHANNELS; ch++) {
-    float sum = 0;
-    float sq_sum = 0;
-
-    // Pass 1: Mean (for centering) and raw values collection
-    // We could optimize by not copying, but accessing logically is safer
-    float signal[INFERENCE_WINDOW_SIZE];
-
-    int idx = buffer_head; // Oldest sample
-    for (int i = 0; i < INFERENCE_WINDOW_SIZE; i++) {
-      signal[i] = window_buffer[idx][ch];
-      sum += signal[i];
-      idx = (idx + 1) % INFERENCE_WINDOW_SIZE;
-    }
-
-    float mean = sum / INFERENCE_WINDOW_SIZE;
-
-    // Pass 2: Centering and Features
-    float wl = 0;
-    int zc = 0;
-    int ssc = 0;
-
-    // Center the signal
-    for (int i = 0; i < INFERENCE_WINDOW_SIZE; i++) {
-      signal[i] -= mean;
-      sq_sum += signal[i] * signal[i];
-    }
-    /* Change 4 — Reinhard tone-mapping: 64·x / (32 + |x|) */
-#if MODEL_USE_REINHARD
-    sq_sum = 0.0f;
-    for (int i = 0; i < INFERENCE_WINDOW_SIZE; i++) {
-      float x = signal[i];
-      signal[i] = 64.0f * x / (32.0f + fabsf(x));
-      sq_sum += signal[i] * signal[i];
-    }
-#endif
-
-    float rms = sqrtf(sq_sum / INFERENCE_WINDOW_SIZE);
-
-    // Thresholds
-    float zc_thresh = FEAT_ZC_THRESH * rms;
-    float ssc_thresh = (FEAT_SSC_THRESH * rms) *
-                       (FEAT_SSC_THRESH * rms); // threshold is on diff product
-
-    for (int i = 0; i < INFERENCE_WINDOW_SIZE - 1; i++) {
-      // WL
-      wl += fabsf(signal[i + 1] - signal[i]);
-
-      // ZC
-      if ((signal[i] > 0 && signal[i + 1] < 0) ||
-          (signal[i] < 0 && signal[i + 1] > 0)) {
-        if (fabsf(signal[i] - signal[i + 1]) > zc_thresh) {
-          zc++;
-        }
-      }
-
-      // SSC (needs 3 points, so loop to N-2)
-      if (i < INFERENCE_WINDOW_SIZE - 2) {
-        float diff1 = signal[i + 1] - signal[i];
-        float diff2 = signal[i + 1] - signal[i + 2];
-        if ((diff1 * diff2) > ssc_thresh) {
-          ssc++;
-        }
-      }
-    }
-
-    // Store features: [RMS, WL, ZC, SSC] per channel
-    int base = ch * 4;
-    features_out[base + 0] = rms;
-    features_out[base + 1] = wl;
-    features_out[base + 2] = (float)zc;
-    features_out[base + 3] = (float)ssc;
-  }
-
-#if MODEL_NORMALIZE_FEATURES
-  // Normalize amplitude-dependent features (RMS, WL) by total RMS across
-  // channels. This makes the model robust to impedance shifts between sessions
-  // while preserving relative channel activation patterns.
-  float total_rms_sq = 0;
-  for (int ch = 0; ch < HAND_NUM_CHANNELS; ch++) {
-    float ch_rms = features_out[ch * 4 + 0];
-    total_rms_sq += ch_rms * ch_rms;
-  }
-  float norm_factor = sqrtf(total_rms_sq);
-  if (norm_factor < 1e-6f) norm_factor = 1e-6f;
-
-  for (int ch = 0; ch < HAND_NUM_CHANNELS; ch++) {
-    features_out[ch * 4 + 0] /= norm_factor;  // RMS
-    features_out[ch * 4 + 1] /= norm_factor;  // WL
-  }
-#endif
-}
-
 // --- Feature extraction (public wrapper used by inference_ensemble.c) ---
 
 void inference_extract_features(float *features_out) {
-#if MODEL_EXPAND_FEATURES
-  compute_features_expanded(features_out);
-#else
-  compute_features(features_out);
+#if !MODEL_EXPAND_FEATURES
+#error "MODEL_EXPAND_FEATURES=0 is no longer supported: the legacy 4-feature/channel \
+extractor was removed. The models, the ensemble gathers and the 69-feature firmware \
+layout all assume the expanded set. Re-export model_weights.h from Python."
 #endif
+  compute_features_expanded(features_out);
   calibration_apply(features_out);
 }
 
@@ -505,131 +380,6 @@ void inference_predict_raw(const float *features, float *proba_out) {
   for (int c = 0; c < MODEL_NUM_CLASSES; c++) {
     proba_out[c] /= sum_exp;
   }
-}
-
-// --- Prediction ---
-
-int inference_predict(float *confidence) {
-  if (samples_collected < INFERENCE_WINDOW_SIZE) {
-    return -1;
-  }
-
-  // 1. Extract Features
-  float features[MODEL_NUM_FEATURES];
-#if MODEL_EXPAND_FEATURES
-  compute_features_expanded(features);
-#else
-  compute_features(features);
-#endif
-
-  // 1b. Change D: z-score normalise using NVS-stored session calibration
-  calibration_apply(features);
-
-  // 2. LDA Inference (Linear Score)
-  float raw_scores[MODEL_NUM_CLASSES];
-  float max_score = -1e9;
-  int max_idx = 0;
-
-  // Calculate raw discriminative scores (SIMD-accelerated on ESP32-S3)
-  for (int c = 0; c < MODEL_NUM_CLASSES; c++) {
-    float dot;
-    dsps_dotprod_f32(features, LDA_WEIGHTS[c], &dot, MODEL_NUM_FEATURES);
-    raw_scores[c] = dot + LDA_INTERCEPTS[c];
-  }
-
-  // Convert scores to probabilities (Softmax)
-  // LDA scores are log-likelihoods + const. Softmax is appropriate.
-  float sum_exp = 0;
-  float probas[MODEL_NUM_CLASSES];
-
-  // Numerical stability: subtract max
-  // Create temp copy for max finding
-  for (int c = 0; c < MODEL_NUM_CLASSES; c++) {
-    if (raw_scores[c] > max_score)
-      max_score = raw_scores[c];
-  }
-
-  for (int c = 0; c < MODEL_NUM_CLASSES; c++) {
-    probas[c] = expf(raw_scores[c] - max_score);
-    sum_exp += probas[c];
-  }
-  for (int c = 0; c < MODEL_NUM_CLASSES; c++) {
-    probas[c] /= sum_exp;
-  }
-
-  // 3. Smoothing
-  // 3a. Probability EMA
-  float max_smoothed_prob = 0;
-  int smoothed_winner = 0;
-
-  for (int c = 0; c < MODEL_NUM_CLASSES; c++) {
-    smoothed_probs[c] = (SMOOTHING_FACTOR * smoothed_probs[c]) +
-                        ((1.0f - SMOOTHING_FACTOR) * probas[c]);
-
-    if (smoothed_probs[c] > max_smoothed_prob) {
-      max_smoothed_prob = smoothed_probs[c];
-      smoothed_winner = c;
-    }
-  }
-
-  // Change C: confidence rejection.
-  // If the strongest smoothed probability is still too low, the classifier is
-  // uncertain — return the last confirmed output without updating vote/debounce state.
-  // This prevents low-confidence transitions from actuating the arm spuriously.
-  if (max_smoothed_prob < CONFIDENCE_THRESHOLD) {
-    *confidence = max_smoothed_prob;
-    return current_output;  // -1 (GESTURE_NONE) until first confident prediction
-  }
-
-  // 3b. Majority Vote
-  vote_history[vote_head] = smoothed_winner;
-  vote_head = (vote_head + 1) % VOTE_WINDOW;
-
-  int counts[MODEL_NUM_CLASSES];
-  memset(counts, 0, sizeof(counts));
-
-  for (int i = 0; i < VOTE_WINDOW; i++) {
-    if (vote_history[i] != -1) {
-      counts[vote_history[i]]++;
-    }
-  }
-
-  int majority_winner = 0;
-  int majority_count = 0;
-  for (int c = 0; c < MODEL_NUM_CLASSES; c++) {
-    if (counts[c] > majority_count) {
-      majority_count = counts[c];
-      majority_winner = c;
-    }
-  }
-
-  // 3c. Debounce
-  int final_result = current_output;
-
-  if (current_output == -1) {
-    current_output = majority_winner;
-    pending_output = majority_winner;
-    pending_count = 1;
-    final_result = majority_winner;
-  } else if (majority_winner == current_output) {
-    pending_output = majority_winner;
-    pending_count = 1;
-  } else if (majority_winner == pending_output) {
-    pending_count++;
-    if (pending_count >= DEBOUNCE_COUNT) {
-      current_output = majority_winner;
-      final_result = majority_winner;
-    }
-  } else {
-    pending_output = majority_winner;
-    pending_count = 1;
-  }
-
-  // Use smoothed probability of the final winner as confidence
-  // Or simpler: use fraction of votes
-  *confidence = (float)majority_count / VOTE_WINDOW;
-
-  return final_result;
 }
 
 const char *inference_get_class_name(int class_idx) {

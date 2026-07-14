@@ -27,7 +27,10 @@
  */
 void gestures_execute(gesture_t gesture);
 
-gesture_t gestures_index_to_gesture(int gesture_idx);
+/* NOTE: there is deliberately no index->gesture_t helper. Class indices are
+ * ALPHABETICAL (fist, hook_em, open, rest, thumbs_up) while gesture_t is not, so
+ * any (idx + 1) style mapping is wrong. Convert by NAME via
+ * inference_get_gesture_enum() / inference_get_gesture_by_name() instead. */
 
 gesture_t parse_gesture(const char *s);
 
