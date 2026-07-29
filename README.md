@@ -1,6 +1,6 @@
 # EMG Winter Soldier Arm
 
-> **Status:** On-device gesture classification is working. Currently integrating servo control with live predictions to close the loop.
+> **Status:** Complete and working end to end — flex your forearm and the hand forms the gesture; flex your bicep and the arm lifts proportionally. All inference runs on the ESP32-S3.
 
 A 3D-printed robotic hand controlled by EMG (electromyography) signals from your forearm. Flex your muscles, and the hand moves. The system runs real-time gesture classification entirely on-device using an ESP32-S3, with no laptop required during inference.
 
@@ -23,8 +23,8 @@ You can start Phase 0 today with no hardware at all.
 - [x] Multi-model voting with EMA smoothing and hysteresis
 - [x] Z-score calibration with NVS persistence
 - [x] Servo driver and gesture execution
-- [ ] Connect prediction output to servo control (final integration)
-- [ ] End-to-end demo: flex forearm, hand moves
+- [x] Connect prediction output to servo control (final integration)
+- [x] End-to-end demo: flex forearm, hand moves | flex bicep, bicep moves
 - [ ] BLE command interface (planned; control is over USB serial today)
 
 ## How It Works
