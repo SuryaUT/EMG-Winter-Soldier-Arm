@@ -371,10 +371,12 @@ static int vote_postprocess(const float *avg_proba, float *confidence) {
  */
 static void run_inference_loop(void) {
   emg_sample_t sample;
-  int last_gesture = -1;
   int stride_counter = 0;
 
   inference_init();
+
+#if ENABLE_HAND
+  int last_gesture = -1;
   vote_init();
 
   int n_models = 1;  /* single LDA always enabled */
@@ -389,6 +391,7 @@ static void run_inference_loop(void) {
 
   printf("{\"status\":\"info\",\"msg\":\"Multi-model inference (%d models)\"}\n",
          n_models);
+#endif /* ENABLE_HAND */
 
   while (g_device_state == STATE_PREDICTING) {
     emg_sensor_read(&sample);
@@ -399,6 +402,7 @@ static void run_inference_loop(void) {
       if (stride_counter >= INFERENCE_HOP_SIZE) {
         stride_counter = 0;
 
+#if ENABLE_HAND
         /* 1. Extract features once */
         float features[MODEL_NUM_FEATURES];
         inference_extract_features(features);
@@ -444,15 +448,21 @@ static void run_inference_loop(void) {
           int gesture_enum = inference_get_gesture_enum(gesture_idx);
           gestures_execute((gesture_t)gesture_enum);
 
-          bicep_state_t bicep = bicep_detect();
-          (void)bicep;
-
           if (gesture_idx != last_gesture) {
             printf("{\"gesture\":\"%s\",\"conf\":%.2f}\n",
                    inference_get_class_name(gesture_idx), confidence);
             last_gesture = gesture_idx;
           }
         }
+#endif /* ENABLE_HAND */
+
+#if ENABLE_BICEP
+#if BICEP_PROPORTIONAL
+        bicep_apply_proportional();
+#else
+        bicep_apply(bicep_detect());
+#endif
+#endif
       }
     }
   }
@@ -501,9 +511,11 @@ static void run_laptop_predict_loop(void) {
 static void run_standalone_loop(void) {
   emg_sample_t sample;
   int stride_counter = 0;
-  int last_gesture = -1;
 
   inference_init();
+
+#if ENABLE_HAND
+  int last_gesture = -1;
   vote_init();
 
   int n_models = 1;
@@ -517,6 +529,7 @@ static void run_standalone_loop(void) {
 #endif
 
   printf("[STANDALONE] Running autonomous EMG control (%d models).\n", n_models);
+#endif /* ENABLE_HAND */
 
   while (1) {
     emg_sensor_read(&sample);
@@ -526,6 +539,7 @@ static void run_standalone_loop(void) {
       if (stride_counter >= INFERENCE_HOP_SIZE) {
         stride_counter = 0;
 
+#if ENABLE_HAND
         float features[MODEL_NUM_FEATURES];
         inference_extract_features(features);
 
@@ -563,9 +577,6 @@ static void run_standalone_loop(void) {
           int gesture_enum = inference_get_gesture_enum(gesture_idx);
           gestures_execute((gesture_t)gesture_enum);
 
-          bicep_state_t bicep = bicep_detect();
-          (void)bicep;
-
           if (gesture_idx != last_gesture) {
             printf("{\"gesture\":\"%s\",\"conf\":%.2f,\"t_ms\":%lu}\n",
                    inference_get_class_name(gesture_idx), confidence,
@@ -575,6 +586,15 @@ static void run_standalone_loop(void) {
             last_gesture = gesture_idx;
           }
         }
+#endif /* ENABLE_HAND */
+
+#if ENABLE_BICEP
+#if BICEP_PROPORTIONAL
+        bicep_apply_proportional();
+#else
+        bicep_apply(bicep_detect());
+#endif
+#endif
       }
     }
   }
@@ -600,6 +620,11 @@ static void run_calibration(void) {
   #define CALIB_MAX_WINDOWS \
 ((CALIB_DURATION_SAMPLES - INFERENCE_WINDOW_SIZE) / INFERENCE_HOP_SIZE + 1)
 
+  /* Discarded after each on-screen prompt: gives the user time to react and
+   * lets the muscle's rest↔flex transition pass so it never taints the RMS. */
+  #define BICEP_CALIB_SETTLE_SAMPLES 1500  /* 1.5 s */
+  #define BICEP_CALIB_MAX_SAMPLES    2000  /* 2 s of sustained max flex */
+
   printf("{\"status\":\"calibrating\",\"duration_ms\":%d}\n", CALIB_DURATION_SAMPLES);
   fflush(stdout);
 
@@ -618,6 +643,24 @@ static void run_calibration(void) {
   int window_count   = 0;
   int stride_counter = 0;
 
+#if ENABLE_BICEP && BICEP_PROPORTIONAL
+  float bicep_rest_sum = 0.0f; int bicep_rest_n = 0;
+  float bicep_max_sum  = 0.0f; int bicep_max_n  = 0;
+
+  /* ---- Prompt: REST phase, then settle out the transition ---- */
+  printf("\n================ CALIBRATION ================\n");
+  printf(">>> REST calibration starting.\n");
+  printf(">>> RELAX your arm completely and keep it still.\n");
+  printf("============================================\n");
+  printf("{\"status\":\"calib_phase\",\"phase\":\"rest\"}\n");
+  fflush(stdout);
+  for (int s = 0; s < BICEP_CALIB_SETTLE_SAMPLES; s++) {
+    emg_sensor_read(&sample);
+    inference_add_sample(sample.channels);  /* warm up filter/buffer, discard */
+  }
+#endif
+
+  /* ---- REST collection: hand z-score features + bicep rest RMS ---- */
   for (int s = 0; s < CALIB_DURATION_SAMPLES; s++) {
     emg_sensor_read(&sample);
     if (inference_add_sample(sample.channels)) {
@@ -629,13 +672,60 @@ static void run_calibration(void) {
               feat_matrix + window_count * MODEL_NUM_FEATURES);
           window_count++;
         }
+#if ENABLE_BICEP && BICEP_PROPORTIONAL
+        bicep_rest_sum += bicep_current_rms();
+        bicep_rest_n++;
+#endif
       }
     }
   }
 
+#if ENABLE_BICEP && BICEP_PROPORTIONAL
+  /* ---- Prompt: MAX phase, settle out the ramp-up, then collect ---- */
+  printf("\n============================================\n");
+  printf(">>> MAX-FLEX calibration starting.\n");
+  printf(">>> FLEX your bicep as HARD as you can and HOLD it.\n");
+  printf("============================================\n");
+  printf("{\"status\":\"calib_phase\",\"phase\":\"max\"}\n");
+  fflush(stdout);
+  for (int s = 0; s < BICEP_CALIB_SETTLE_SAMPLES; s++) {
+    emg_sensor_read(&sample);
+    inference_add_sample(sample.channels);  /* let the ramp to full flex pass */
+  }
+
+  int bicep_stride = 0;
+  for (int s = 0; s < BICEP_CALIB_MAX_SAMPLES; s++) {
+    emg_sensor_read(&sample);
+    if (inference_add_sample(sample.channels)) {
+      if (++bicep_stride >= INFERENCE_HOP_SIZE) {
+        bicep_stride = 0;
+        bicep_max_sum += bicep_current_rms();
+        bicep_max_n++;
+      }
+    }
+  }
+  printf(">>> You can relax now.\n\n");
+  fflush(stdout);
+#endif
+
   if (window_count >= 10) {
     calibration_update(feat_matrix, window_count, MODEL_NUM_FEATURES);
+#if ENABLE_BICEP && BICEP_PROPORTIONAL
+    if (bicep_rest_n > 0 && bicep_max_n > 0) {
+      float rest_rms = bicep_rest_sum / bicep_rest_n;
+      float max_rms  = bicep_max_sum  / bicep_max_n;
+      if (max_rms > rest_rms * 1.2f) {
+        bicep_set_proportional(rest_rms, max_rms);
+        bicep_save_proportional(rest_rms, max_rms);
+      } else {
+        printf("{\"status\":\"error\",\"msg\":\"Bicep max not distinct from rest "
+               "(rest=%.2f max=%.2f) — flex harder and recalibrate\"}\n",
+               rest_rms, max_rms);
+      }
+    }
+#else
     bicep_calibrate_from_buffer(INFERENCE_WINDOW_SIZE);
+#endif
     printf("{\"status\":\"calibrated\",\"windows\":%d}\n", window_count);
   } else {
     printf("{\"status\":\"error\",\"msg\":\"Not enough calibration data\"}\n");
@@ -646,6 +736,8 @@ static void run_calibration(void) {
 
   #undef CALIB_DURATION_SAMPLES
   #undef CALIB_MAX_WINDOWS
+  #undef BICEP_CALIB_SETTLE_SAMPLES
+  #undef BICEP_CALIB_MAX_SAMPLES
 }
 
 #if MAIN_MODE == PARITY_DUMP
@@ -838,14 +930,25 @@ void app_main(void) {
   printf("[INIT] Loading NVS calibration...\n");
   calibration_init();  // Change D: no-op on first boot; loads if previously saved
 
-  // Bicep: load persisted threshold from NVS (if previously calibrated)
+  // Bicep: load persisted calibration from NVS (if previously calibrated)
   {
+#if ENABLE_BICEP && BICEP_PROPORTIONAL
+    float bicep_rest = 0.0f, bicep_max = 0.0f;
+    if (bicep_load_proportional(&bicep_rest, &bicep_max)) {
+      printf("[INIT] Bicep proportional calib loaded: rest=%.2f max=%.2f\n",
+             bicep_rest, bicep_max);
+    } else {
+      printf("[INIT] No bicep proportional calibration — run 'calibrate' "
+             "command (rest + max-flex)\n");
+    }
+#else
     float bicep_thresh = 0.0f;
     if (bicep_load_threshold(&bicep_thresh)) {
       printf("[INIT] Bicep threshold loaded: %.1f\n", bicep_thresh);
     } else {
       printf("[INIT] No bicep calibration — run 'calibrate' command\n");
     }
+#endif
   }
 
   printf("[INIT] Using REAL EMG sensors\n");
@@ -889,7 +992,7 @@ void app_main(void) {
         continue;
 
       if (sscanf(buf, "%d", &angle) == 1) {
-        hand_set_finger_angle(JOINT_THUMB, angle);
+        hand_set_finger_angle(JOINT_BICEP, angle);
           vTaskDelay(pdMS_TO_TICKS(1000));
       } else {
         printf("Invalid input.\n");

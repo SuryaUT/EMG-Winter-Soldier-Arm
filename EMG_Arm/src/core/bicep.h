@@ -52,6 +52,18 @@ float bicep_calibrate(const uint16_t *ch3_samples, int n_samples);
 bicep_state_t bicep_detect(void);
 
 /**
+ * @brief Drive the bicep servo to match the detected state (edge-triggered).
+ *
+ * Commands the bicep servo (JOINT_BICEP -> PCA channel 6) to BICEP_FLEX_ANGLE
+ * on FLEX and BICEP_REST_ANGLE on REST. The servo is written only when the
+ * state changes from the previously applied state, avoiding redundant I2C
+ * writes every inference hop. Typical use: bicep_apply(bicep_detect()).
+ *
+ * @param state  Desired bicep state (from bicep_detect()).
+ */
+void bicep_apply(bicep_state_t state);
+
+/**
  * @brief Persist the current threshold to NVS.
  *
  * @param threshold_mv  Threshold value to save (in mV / same units as bicep RMS).
@@ -93,5 +105,63 @@ float bicep_get_threshold(void);
  * @return Computed threshold (same units as bicep_detect sees).
  */
 float bicep_calibrate_from_buffer(int n_samples);
+
+/*******************************************************************************
+ * Proportional control (continuous flex)
+ *
+ * Instead of snapping between two angles, the servo tracks muscle effort:
+ * activation level in [0,1] is derived from the live windowed RMS, normalized
+ * against a two-point calibration (rest RMS floor, max-flex RMS ceiling). A
+ * half-strength contraction holds the arm roughly halfway.
+ ******************************************************************************/
+
+/**
+ * @brief Current windowed bicep RMS (same window bicep_detect() uses).
+ *
+ * Convenience wrapper over inference_get_bicep_rms() so callers don't need to
+ * know the internal window size. Used during two-point calibration.
+ */
+float bicep_current_rms(void);
+
+/**
+ * @brief Set the proportional calibration reference points.
+ *
+ * @param rest_rms  Windowed RMS with the muscle relaxed (lower bound → 0.0).
+ * @param max_rms   Windowed RMS at a hard, sustained flex (upper bound → 1.0).
+ */
+void bicep_set_proportional(float rest_rms, float max_rms);
+
+/**
+ * @brief Persist the proportional calibration (rest + max RMS) to NVS.
+ * @return true on success.
+ */
+bool bicep_save_proportional(float rest_rms, float max_rms);
+
+/**
+ * @brief Load the persisted proportional calibration from NVS.
+ *
+ * @param rest_rms_out  Output; untouched on failure.
+ * @param max_rms_out   Output; untouched on failure.
+ * @return true if a valid (max > rest) calibration was loaded.
+ */
+bool bicep_load_proportional(float *rest_rms_out, float *max_rms_out);
+
+/**
+ * @brief Current bicep activation level, clamped to [0,1].
+ *
+ * 0.0 = at/below the rest floor, 1.0 = at/above the max ceiling. Reads the
+ * latest windowed RMS and normalizes by (max - rest). A dead-zone near rest
+ * forces a relaxed muscle to read exactly 0. Returns 0 if not calibrated.
+ */
+float bicep_get_level(void);
+
+/**
+ * @brief Drive the bicep servo proportionally to muscle effort (call every hop).
+ *
+ * Smooths bicep_get_level() with an EMA to suppress EMG jitter, rate-limits how
+ * fast the target angle may slew, and writes the servo only when the angle has
+ * moved meaningfully (keeps I2C traffic down while holding a pose).
+ */
+void bicep_apply_proportional(void);
 
 #endif /* BICEP_H */

@@ -78,6 +78,14 @@ DATA_DIR = Path("collected_data")  # Directory to store session files
 MODEL_DIR = Path("models")         # Directory to store trained models
 USER_ID = "user_001"               # Current user ID (change per user)
 
+# Training configuration — single switch shared by all three model trainers
+# (EMGClassifier.train, train_ensemble.py, train_mlp_tflite.py).
+# Data augmentation (3x gain/noise variants) was MEASURED to hurt real-world
+# accuracy by ~5 pts on both within-session and leave-one-session-out CV: the
+# per-session z-score already delivers cross-session robustness, so augmentation
+# is redundant and just distorts training. Set back to True to restore it.
+USE_AUGMENTATION = False
+
 # =============================================================================
 # LABEL ALIGNMENT CONFIGURATION
 # =============================================================================
@@ -2212,7 +2220,7 @@ class EMGClassifier:
         ensemble (train_ensemble.py) and the MLP (train_mlp_tflite.py) train on
         byte-identical inputs.
         """
-        augment = getattr(self, 'use_augmentation', True)
+        augment = getattr(self, 'use_augmentation', USE_AUGMENTATION)
         raw_stats: dict = {}
         X_features, y_aug, session_indices, trial_ids, sigma_train = build_training_matrix(
             X, y,

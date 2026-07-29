@@ -15,9 +15,34 @@
  * Main Modes
  ******************************************************************************/
 
-enum {REAL_MAIN, EMG_MAIN, SERVO_CALIBRATOR_ANGLE, SERVO_CALIBRATOR_DUTY, GESTURE_TESTER, EMG_STANDALONE, CONTINUOUS_TEST, PARITY_DUMP};
+/* Mode selectors must be #define (not enum) so they are visible to the
+ * preprocessor. The `#if MAIN_MODE == PARITY_DUMP` guards in main.c compare
+ * these at preprocess time; enum constants would both expand to 0 there,
+ * making every such guard always-true. */
+#define REAL_MAIN              0
+#define EMG_MAIN               1
+#define SERVO_CALIBRATOR_ANGLE 2
+#define SERVO_CALIBRATOR_DUTY  3
+#define GESTURE_TESTER         4
+#define EMG_STANDALONE         5
+#define CONTINUOUS_TEST        6
+#define PARITY_DUMP            7
 
 #define MAIN_MODE REAL_MAIN
+
+/* Live-inference subsystem enables (independent). When 1, the live-inference
+ * loops compile and run that subsystem; when 0 it is not compiled in.
+ *   ENABLE_HAND  — hand gesture inference + servo control (fingers/wrist)
+ *   ENABLE_BICEP — bicep flex detection + bicep servo control (PCA ch 6) */
+#define ENABLE_HAND   0
+#define ENABLE_BICEP  1
+
+/* Bicep control style (only meaningful when ENABLE_BICEP == 1):
+ *   1 — PROPORTIONAL: servo angle tracks muscle effort continuously, so a
+ *       half-flex holds the arm halfway. Needs a two-point calibration
+ *       (rest RMS + max-flex RMS). One EMG channel (ch3) is sufficient.
+ *   0 — BINARY: original flex/rest threshold detector (single rest calib). */
+#define BICEP_PROPORTIONAL 1
 
 /* PARITY_DUMP: number of inference hops to dump.
  * The rep                                                                                                                                         ay is 75564 samples at hop 25 -> ~3022 hops. 3100 covers the whole
@@ -67,7 +92,7 @@ enum {REAL_MAIN, EMG_MAIN, SERVO_CALIBRATOR_ANGLE, SERVO_CALIBRATOR_DUTY, GESTUR
 // #define PCA_CH_RING               3
 // #define PCA_CH_PINKY              4
 // #define PCA_CH_WRIST              5
-// #define PCA_CH_BICEP              6
+// #define PCA_CH_BICEP              6 
 enum {PCA_CH_THUMB, PCA_CH_INDEX, PCA_CH_MIDDLE, PCA_CH_RING, PCA_CH_PINKY, PCA_CH_WRIST, PCA_CH_BICEP};
 
 /*******************************************************************************

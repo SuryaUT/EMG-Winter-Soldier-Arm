@@ -17,7 +17,8 @@ from sklearn.model_selection import cross_val_predict, GroupKFold, cross_val_sco
 import sys
 sys.path.insert(0, str(Path(__file__).parent))
 from learning_data_collection import (
-    SessionStorage, make_feature_extractor, build_training_matrix, HAND_CHANNELS
+    SessionStorage, make_feature_extractor, build_training_matrix, HAND_CHANNELS,
+    USE_AUGMENTATION
 )
 
 # --- Load + shared training pipeline -----------------------------------------
@@ -31,7 +32,7 @@ X_raw, y, trial_ids, session_indices, label_names, _ = storage.load_all_for_trai
 # GroupKFold out-of-fold stacking below keeps a window's augmented copies in the
 # same fold — without this the meta-LDA would train on leaked specialist probs.
 X, y, session_indices, trial_ids, sigma_train = build_training_matrix(
-    X_raw, y, session_indices=session_indices, trial_ids=trial_ids, augment=True)
+    X_raw, y, session_indices=session_indices, trial_ids=trial_ids, augment=USE_AUGMENTATION)
 X = X.astype(np.float64)
 
 extractor = make_feature_extractor(channels=HAND_CHANNELS)

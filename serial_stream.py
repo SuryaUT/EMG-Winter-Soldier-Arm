@@ -115,6 +115,7 @@ class RealSerialStream:
         self.state = ConnectionState.DISCONNECTED
         self.device_info: Optional[Dict[str, Any]] = None
         self._auto_detect_result: Optional[Dict[str, Any]] = None  # Cache for concurrent auto-detect
+        self._rx_buffer = b''  # Byte buffer for bulk-read line parsing (see _readline_raw)
 
     def connect(self, timeout: float = 5.0) -> Dict[str, Any]:
         """
@@ -156,6 +157,7 @@ class RealSerialStream:
 
             # Clear any stale data in the buffer
             self.serial.reset_input_buffer()
+            self._rx_buffer = b''
             time.sleep(0.1)  # Let device settle after port open
 
             print(f"[SERIAL] Port opened: {self.port}")
@@ -331,16 +333,33 @@ class RealSerialStream:
         """
         @brief Read one line from serial port (internal helper).
 
-        @return Decoded line string, or None if timeout/error.
+        Drains all bytes currently waiting on the port in a single bulk read
+        and pops one complete line from an internal buffer. This replaces
+        pyserial's byte-at-a-time ``readline()``, which cannot keep up with the
+        1 kHz stream: when the reader falls behind, the OS receive buffer backs
+        up and every parsed sample is stamped later than it was captured,
+        misaligning training labels. Bulk reads keep the reader caught up to
+        real time so receipt timestamps track capture time.
+
+        @return Decoded line string, or None if no complete line is available.
         """
         if not self.serial or not self.serial.is_open:
             return None
 
         try:
-            line_bytes = self.serial.readline()
-            if line_bytes:
-                return line_bytes.decode('utf-8', errors='ignore').strip()
-            return None
+            # If we don't already have a full line buffered, pull whatever is
+            # waiting (or block up to `timeout` for at least one byte).
+            if b'\n' not in self._rx_buffer:
+                waiting = self.serial.in_waiting
+                chunk = self.serial.read(waiting if waiting > 0 else 1)
+                if not chunk:
+                    return None  # timeout, no data
+                self._rx_buffer += chunk
+                if b'\n' not in self._rx_buffer:
+                    return None  # partial line so far; caller will retry
+
+            line, _, self._rx_buffer = self._rx_buffer.partition(b'\n')
+            return line.decode('utf-8', errors='ignore').strip()
 
         except serial.SerialException:
             return None

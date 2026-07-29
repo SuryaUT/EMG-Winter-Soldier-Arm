@@ -9,7 +9,8 @@ import numpy as np
 from pathlib import Path
 import sys
 sys.path.insert(0, str(Path(__file__).parent))
-from learning_data_collection import SessionStorage, build_training_matrix, HAND_CHANNELS
+from learning_data_collection import (SessionStorage, build_training_matrix, HAND_CHANNELS,
+                                       USE_AUGMENTATION)
 
 try:
     import tensorflow as tf
@@ -26,7 +27,7 @@ X_raw, y, trial_ids, session_indices, label_names, _ = storage.load_all_for_trai
 # per-session class-balanced z-score with REAL-only stats. Guarantees the MLP
 # trains on byte-identical inputs to the other two models.
 X, y, session_indices, trial_ids, sigma_train = build_training_matrix(
-    X_raw, y, session_indices=session_indices, trial_ids=trial_ids, augment=True)
+    X_raw, y, session_indices=session_indices, trial_ids=trial_ids, augment=USE_AUGMENTATION)
 X = X.astype(np.float32)
 
 n_feat = X.shape[1]

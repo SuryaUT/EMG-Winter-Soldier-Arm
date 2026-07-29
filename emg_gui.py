@@ -835,16 +835,25 @@ class CollectionPage(BasePage):
                     self.countdown_label.configure(text=f"Total: {remaining:.1f}s remaining")
 
                 elif msg_type == 'samples_batch':
-                    # Update plot data with batch of samples
-                    for sample in data:
-                        for i, val in enumerate(sample):
-                            self.plot_data[i] = np.roll(self.plot_data[i], -1)
-                            self.plot_data[i][-1] = val
-
-                    # Update plot lines once per batch
-                    for i in range(len(self.plot_lines)):
-                        self.plot_lines[i].set_ydata(self.plot_data[i])
-                    needs_redraw = True
+                    # Update plot data with batch of samples. Shift each channel
+                    # buffer left once per batch (in place) instead of calling
+                    # np.roll per sample — np.roll allocates a full copy every
+                    # call, which at 1 kHz pegged the Tkinter main thread.
+                    batch = np.asarray(data, dtype=float)  # (n_samples, n_channels)
+                    n = batch.shape[0]
+                    if n:
+                        n_ch = min(len(self.plot_data), batch.shape[1])
+                        for i in range(n_ch):
+                            buf = self.plot_data[i]
+                            cap = len(buf)
+                            if n >= cap:
+                                buf[:] = batch[-cap:, i]
+                            else:
+                                buf[:-n] = buf[n:]
+                                buf[-n:] = batch[:, i]
+                        for i in range(len(self.plot_lines)):
+                            self.plot_lines[i].set_ydata(self.plot_data[i])
+                        needs_redraw = True
 
                 elif msg_type == 'window_count':
                     self.window_count_label.configure(text=f"Windows: {data}")
@@ -1444,16 +1453,18 @@ class TrainingPage(BasePage):
         self.content.grid(row=1, column=0, sticky="nsew")
         self.content.grid_columnconfigure(0, weight=1)
 
-        # Sessions info
-        self.info_frame = ctk.CTkFrame(self.content)
-        self.info_frame.pack(fill="x", padx=20, pady=20)
+        # Sessions info — scrollable and height-capped so a long session list
+        # never pushes the train / export / ensemble / MLP buttons off-screen.
+        self.info_frame = ctk.CTkScrollableFrame(self.content, height=120)
+        self.info_frame.pack(fill="x", padx=20, pady=(20, 10))
 
         self.sessions_label = ctk.CTkLabel(
             self.info_frame,
             text="Loading sessions...",
-            font=ctk.CTkFont(size=14)
+            font=ctk.CTkFont(size=14),
+            justify="left"
         )
-        self.sessions_label.pack(pady=10)
+        self.sessions_label.pack(pady=10, anchor="w")
 
         # Model name input
         name_frame = ctk.CTkFrame(self.content, fg_color="transparent")
@@ -1596,6 +1607,29 @@ class TrainingPage(BasePage):
     def on_show(self):
         """Update session info when shown."""
         self.update_session_info()
+        self._refresh_advanced_buttons()
+
+    def _firmware_model_header(self) -> Path:
+        """Path to the firmware's exported LDA header (what the ensemble/MLP
+        scripts build against)."""
+        return Path(__file__).parent / "EMG_Arm" / "src" / "core" / "model_weights.h"
+
+    def _refresh_advanced_buttons(self):
+        """Enable Ensemble/MLP training whenever an exported model_weights.h
+        exists. These buttons shell out to standalone scripts that reload the
+        data themselves, so they don't need an in-memory classifier — gating
+        them on an in-session LDA retrain just forced a slow retrain after every
+        GUI restart."""
+        if self._firmware_model_header().exists():
+            self.train_ensemble_button.configure(state="normal")
+            self.train_mlp_button.configure(state="normal")
+            self.adv_desc.configure(
+                text="Ensemble: 3-specialist LDA stacker  |  MLP: int8 neural net"
+            )
+        else:
+            self.train_ensemble_button.configure(state="disabled")
+            self.train_mlp_button.configure(state="disabled")
+            self.adv_desc.configure(text="(export a base LDA first)")
 
     def update_session_info(self):
         """Update the sessions information display."""
@@ -1732,13 +1766,11 @@ class TrainingPage(BasePage):
             self.after(0, lambda: self.export_button.configure(
                 state="normal" if can_export else "disabled"
             ))
-            # Enable advanced training buttons after successful LDA training
-            if can_export:
-                self.after(0, lambda: self.train_ensemble_button.configure(state="normal"))
-                self.after(0, lambda: self.train_mlp_button.configure(state="normal"))
-                self.after(0, lambda: self.adv_desc.configure(
-                    text="Ensemble: 3-specialist LDA stacker  |  MLP: int8 neural net"
-                ))
+            # Ensemble/MLP training runs standalone scripts that reload data and
+            # only need an exported model_weights.h — not the in-memory
+            # classifier — so gate them on that header existing, not on this
+            # session having retrained the LDA.
+            self.after(0, self._refresh_advanced_buttons)
 
     def _train_ensemble(self):
         """Train the 3-specialist + meta-LDA ensemble (runs train_ensemble.py)."""
@@ -1785,21 +1817,30 @@ class TrainingPage(BasePage):
         def _run():
             try:
                 script = str(Path(__file__).parent / "train_mlp_tflite.py")
-                # TensorFlow needs Python <=3.12; try py launcher first
+                # TensorFlow needs Python <=3.12; prefer a 3.12 that has it.
+                # Probe with importlib.util.find_spec, which checks whether the
+                # package is installed WITHOUT importing it — TensorFlow's real
+                # import can take 30s+ cold on Windows, which previously timed
+                # out the probe and (since only FileNotFoundError was caught)
+                # aborted the entire MLP run. find_spec returns in milliseconds.
                 python_cmd = [sys.executable]
                 try:
                     probe = subprocess.run(
-                        ["py", "-3.12", "-c", "import tensorflow"],
-                        capture_output=True, timeout=30,
+                        ["py", "-3.12", "-c",
+                         "import importlib.util, sys; "
+                         "sys.exit(0 if importlib.util.find_spec('tensorflow') else 1)"],
+                        capture_output=True, timeout=15,
                     )
                     if probe.returncode == 0:
                         python_cmd = ["py", "-3.12"]
                         self.after(0, lambda: self._log("Using Python 3.12 (TensorFlow compatible)"))
-                except FileNotFoundError:
-                    pass
+                except (FileNotFoundError, subprocess.TimeoutExpired):
+                    pass  # py launcher missing or unresponsive -> current interpreter
+                # 30 min: full-dataset feature extraction (~210k augmented
+                # windows) + 150 epochs on CPU can exceed the old 10 min limit.
                 result = subprocess.run(
                     python_cmd + [script],
-                    capture_output=True, text=True, timeout=600
+                    capture_output=True, text=True, timeout=1800
                 )
                 output = result.stdout + result.stderr
                 self.after(0, lambda: self._log(output))
@@ -1848,6 +1889,7 @@ class TrainingPage(BasePage):
             try:
                 path = self.classifier.export_to_header(filename)
                 self._log(f"\nExported model to: {path}")
+                self._refresh_advanced_buttons()
                 messagebox.showinfo("Export Success", f"Model exported to:\n{path}\n\nRecompile ESP32 firmware to apply.")
             except Exception as e:
                 messagebox.showerror("Export Error", f"Failed to export: {e}")
