@@ -25,7 +25,6 @@ You can start Phase 0 today with no hardware at all.
 - [x] Servo driver and gesture execution
 - [x] Connect prediction output to servo control (final integration)
 - [x] End-to-end demo: flex forearm, hand moves | flex bicep, bicep moves
-- [ ] BLE command interface (planned; control is over USB serial today)
 
 ## How It Works
 
