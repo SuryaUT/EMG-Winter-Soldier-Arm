@@ -124,58 +124,51 @@ used up · `Optional` nice to have.
 
 | Item | Qty | Role | Link | Notes |
 |------|-----|------|------|-------|
-| ESP32-S3-DevKitC-1, N16R16 (16 MB flash / 16 MB PSRAM) | 1 | Build | *(link)* | `platformio.ini` configures 32 MB; adjust `board_upload.flash_size` + `partitions.csv` for your variant |
-| MyoWare 2.0 Muscle Sensor | 4 | Build | *(link)* | 3 forearm + 1 bicep |
+| ESP32-S3-DevKitC-1, N16R16 (16 MB flash / 16 MB PSRAM) | 1 | Build | [*(link)*](https://a.co/d/01Zu2owI) | `platformio.ini` configures 32 MB; adjust `board_upload.flash_size` + `partitions.csv` for your variant |
+| MyoWare 2.0 Muscle Sensor | 4 | Build | [*(link)*](https://www.amazon.com/MyoWare-DEV-27924-2-Muscle-Sensor/dp/B0DX624319/ref=sr_1_1?dib=eyJ2IjoiMSJ9.v5-Px_ad26wSnFEfUGOUK5HHLwoZUUjlxa0zemubPmrwtG0NBcjCJZtSv4g54TZiXpmF7KPmmxXB_kJlRST7QGOVnEGflzkCr6MYA5SIZmtaRoeqBOat3yBYwjlSZaxGF_d_IAL2t9k59noDEQREbA.c_ErMeYEB7pXSrFJofNaYj8G8Z07VQRzO2fn5DXQTEU&dib_tag=se&keywords=myoware+muscle+sensor&qid=1785292872&sr=8-1) | 3 forearm + 1 bicep |
 | MyoWare 2.0 Cable Shield | 4 | Build | [*(link)*](https://www.sparkfun.com/myoware-2-0-cable-shield.html) | Breaks the sensor out to a standard cable — one per sensor |
-| 3-Lead Electrode Sensor Cable (snap connectors) | 4 | Build | *(link)* | Lets you place electrodes remotely instead of snapping the board to your skin |
-| Disposable Ag/AgCl Surface EMG Electrodes | ~100 | Consumable | *(link)* | 3 per sensor per session. Buy far more than you think |
-| PCA9685 16-Channel 12-bit PWM/Servo Driver (I²C) | 1 | Build | *(link)* | Address 0x40 by default |
-| UBEC / Switching BEC, 6 V output, ≥5 A | 1 | Build | *(link)* | Steps the LiPo down to servo voltage. A linear regulator will overheat |
-| LiPo Battery Pack, 1200 mAh 30C | 1–2 | Build | *(link)* | 30C ≈ 36 A burst, which is what the stall current needs |
-| LiPo Balance Charger | 1 | Tool | *(link)* | **Gap:** not optional if you own LiPos |
-| LiPo Safe Charging Bag | 1 | Tool | *(link)* | **Gap:** cheap insurance |
-| USB-C Cable (**data**, not charge-only) | 1 | Tool | *(link)* | **Gap:** the single most common "my board won't enumerate" cause |
-| Solderless Breadboard, 830-point | 1 | Build | *(link)* | |
-| Jumper Wires (M-M and M-F) | 1 kit | Build | *(link)* | |
-| 3-Conductor Servo Extension Wire | ~5 m | Build | *(link)* | Forearm servos sit far from the PCA9685 |
-| Digital Multimeter | 1 | Tool | *(link)* | **Gap:** you will need it for continuity, rail voltage, and I²C debugging |
+| 3-Lead Electrode Sensor Cable (snap connectors) | 4 | Build | [*(link)*](https://www.digikey.com/en/products/detail/sparkfun-electronics/12970/6833933?gclsrc=aw.ds&gad_source=4&gad_campaignid=20232005509&gbraid=0AAAAADrbLliTwurUgMbroaDIsc7uZVEOk&gclid=CjwKCAjwpqHTBhAcEiwAj2AfusFTLBP524ra8qG8XtxSopLvLCPZ8QOEuEz0MOZcQxD1wLX_tgoRfxoCaF0QAvD_BwE) | Lets you place electrodes remotely instead of snapping the board to your skin |
+| Disposable Ag/AgCl Surface EMG Electrodes | ~100 | Consumable | [*(link)*](https://a.co/d/05unx08C) | 3 per sensor per session. Buy far more than you think |
+| PCA9685 16-Channel 12-bit PWM/Servo Driver (I²C) | 1 | Build | [*(link)*](https://a.co/d/03bYEglJ) | Address 0x40 by default |
+| UBEC / Switching BEC, 6 V output, ≥5 A | 1 | Build | [*(link)*](https://a.co/d/0gzf33Go) | Steps the LiPo down to servo voltage. A linear regulator will overheat. Be careful, mine blew up because of back EMG :( |
+| LiPo Battery Pack, 7.4V 1000 mAh 35C | 1–2 | Build | [*(link)*](https://a.co/d/0gQ62Iaj) | 30C ≈ 36 A burst, which is what the stall current needs |
+| Solderless Breadboard, 830-point | 1 | Build | [*(link)*](https://a.co/d/0aHjkt24) | |
+| Jumper Wires (M-M and M-F) | 1 kit | Build | [*(link)* ](https://a.co/d/098IxODU)| |
+| 3-Conductor Servo Extension Wire | ~5 m | Build | [*(link)* ](https://a.co/d/0bHubucZ)| Forearm servos sit far from the PCA9685 |
+| Digital Multimeter | 1 | Tool | [*(link)*](https://a.co/d/0h7MyC6Q) | For continuity, rail voltage, and I²C debugging |
 
 ### Actuators
 
 | Item | Qty | Role | Link | Notes |
 |------|-----|------|------|-------|
-| MG996R Metal-Gear Servo, 180° | 6 | Build | *(link)* | 5 fingers + wrist. Buy a spare — gears strip |
-| Hitec HS-805BB Mega Giant-Scale Servo | 1 | Build | *(link)* | Bicep only. Needs the torque to lift the forearm |
+| MG996R Metal-Gear Servo, 180° | 6 | Build | [*(link)*](https://a.co/d/0fHCpXH0) | 5 fingers + wrist. Buy a spare — gears strip |
+| Hitec HS-805BB Mega Giant-Scale Servo | 1 | Build | [*(link)*](https://a.co/d/09RSyvfb) | Bicep only. Needs the torque to lift the forearm |
 
 ### Mechanical / printed parts
 
 | Item | Qty | Role | Link | Notes |
 |------|-----|------|------|-------|
-| 3D Printer | 1 | Tool | *(link)* | Or a print service |
-| PLA or PETG Filament | ~1.5 kg | Consumable | *(link)* | **Gap:** PETG for the tendon-loaded parts; PLA creeps under sustained spring tension |
-| Braided Fishing Line, ~50 lb | 1 spool | Build | *(link)* | InMoov tendons. Braided, **not** monofilament — mono stretches |
-| Extension Spring Assortment (**loop ends both sides**) | 1 kit | Build | *(link)* | The loops are what hook into the finger returns |
-| Steel Wire, ~1.5 mm | ~1 m | Build | *(link)* | Finger joint pins |
-| Machine Screw Assortment, M3 | 1 kit | Build | *(link)* | Non-self-tapping. See InMoov per-part sizes |
-| Self-Tapping Screw Assortment, M2–M3 | 1 kit | Build | *(link)* | Bites directly into printed plastic |
-| Bolt & Nut Assortment, M3 (~10 mm / ⅜ in) | 1 kit | Build | *(link)* | One size smaller also works in most spots |
+| 3D Printer | 1 | Tool | access | Or a print service |
+| Braided Fishing Line, ~50 lb | 1 spool | Build | [*(link)*](https://a.co/d/0hsfSs5g) | InMoov tendons. Braided, **not** monofilament — mono stretches |
+| Extension Spring Assortment (**loop ends both sides**) | 1 kit | Build | [*(link)*](https://a.co/d/00P6AhfA) | The loops are what hook into the finger returns |
+| Steel Wire, ~1.5 mm | ~1 m | Build | [*(link)*](https://a.co/d/0e5UOqwR) | Finger joint pins |
+| Machine Screw Assortment, M3 | 1 kit | Build | [*(link)* ](https://a.co/d/01VloJq8)| Non-self-tapping. See InMoov per-part sizes |
+| Self-Tapping Screw Assortment, M2–M3 | 1 kit | Build | [*(link)*](https://a.co/d/07lniRKH) | Bites directly into printed plastic |
+| Bolt & Nut Assortment, M3 (~10 mm / ⅜ in) | 1 kit | Build | [*(link)*](https://a.co/d/03Ur42Af) | One size smaller also works in most spots |
 
 ### Tools & consumables
 
 | Item | Qty | Role | Link | Notes |
 |------|-----|------|------|-------|
-| Soldering Iron + Solder | 1 | Tool | *(link)* | |
-| Desoldering Pump (solder sucker) | 1 | Tool | *(link)* | |
-| Wire Strippers | 1 | Tool | *(link)* | |
-| Precision Screwdriver Set | 1 | Tool | *(link)* | |
-| Needle File Set | 1 | Tool | *(link)* | Cleaning up print seams and tendon channels |
-| Drill Bit Set, 1–4 mm (+ pin vise or rotary tool) | 1 | Tool | *(link)* | Reaming holes that printed undersize |
-| Tweezers | 1 | Tool | *(link)* | Threading tendons |
-| Electrical Tape | 1 roll | Consumable | *(link)* | |
-| Spiral Cable Wrap | ~2 m | Build | *(link)* | Bundles the servo/sensor runs down the forearm |
-| Isopropyl Alcohol Wipes | 1 box | Consumable | *(link)* | **Gap:** skin prep. Dramatically lowers electrode impedance |
-| Disposable Razor | 1 | Consumable | *(link)* | **Gap:** hair ruins electrode contact |
-| Compression Arm Sleeve | 1 | Optional | *(link)* | Holds electrodes down after placement; noticeably reduces motion artifacts |
+| Soldering Iron Kit | 1 | Tool | [*(link)*](https://a.co/d/02wGKQ0J) | |
+| Wire Strippers | 1 | Tool | [*(link)* ](https://a.co/d/07zsa6Tv)| |
+| Precision Screwdriver Set | 1 | Tool | [*(link)* ](https://a.co/d/0cbxM4zT)| |
+| Needle File Set | 1 | Tool | [*(link)*](https://a.co/d/0av92Gj7) | Cleaning up print seams and tendon channels |
+| Drill Bit Set, 1–4 mm (+ pin vise or rotary tool) | 1 | Tool | [*(link)* ](https://a.co/d/0dqA5nTE)| Reaming holes that printed undersize |
+| Electrical Tape | 1 roll | Consumable | [*(link)*](https://a.co/d/00nZZ1Ma) | |
+| Spiral Cable Wrap | ~2 m | Build | [*(link)*](https://a.co/d/01rqrUJs) | Bundles the servo/sensor runs down the forearm |
+| Isopropyl Alcohol Wipes | 1 box | Consumable | [*(link)*](https://a.co/d/07eMzxHi) | Skin prep. Dramatically lowers electrode impedance |
+| Compression Arm Sleeve | 1 | Optional | [*(link)*](https://a.co/d/052m7mYf) | Holds electrodes down after placement; noticeably reduces motion artifacts |
 
 > **Safety:** you are sticking electrodes to your skin. Run the ESP32 from a battery or a
 > properly isolated USB supply during recording — do not have electrodes on your arm while the
