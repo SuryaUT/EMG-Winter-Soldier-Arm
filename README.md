@@ -20,8 +20,8 @@ A 3D-printed robotic hand controlled by EMG (electromyography) signals from your
 - [x] BLE command interface
 - [x] Z-score calibration with NVS persistence
 - [x] Servo driver and gesture execution
-- [ ] Connect prediction output to servo control (final integration)
-- [ ] End-to-end demo: flex forearm, hand moves
+- [x] Connect prediction output to servo control (final integration)
+- [x] End-to-end demo: flex forearm, hand moves | flex bicep, bicep moves
 
 ## How It Works
 
