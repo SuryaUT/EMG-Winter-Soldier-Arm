@@ -126,7 +126,7 @@ used up · `Optional` nice to have.
 |------|-----|------|------|-------|
 | ESP32-S3-DevKitC-1, N16R16 (16 MB flash / 16 MB PSRAM) | 1 | Build | *(link)* | `platformio.ini` configures 32 MB; adjust `board_upload.flash_size` + `partitions.csv` for your variant |
 | MyoWare 2.0 Muscle Sensor | 4 | Build | *(link)* | 3 forearm + 1 bicep |
-| MyoWare 2.0 Cable Shield | 4 | Build | *(link)* | Breaks the sensor out to a standard cable — one per sensor |
+| MyoWare 2.0 Cable Shield | 4 | Build | [*(link)*](https://www.sparkfun.com/myoware-2-0-cable-shield.html) | Breaks the sensor out to a standard cable — one per sensor |
 | 3-Lead Electrode Sensor Cable (snap connectors) | 4 | Build | *(link)* | Lets you place electrodes remotely instead of snapping the board to your skin |
 | Disposable Ag/AgCl Surface EMG Electrodes | ~100 | Consumable | *(link)* | 3 per sensor per session. Buy far more than you think |
 | PCA9685 16-Channel 12-bit PWM/Servo Driver (I²C) | 1 | Build | *(link)* | Address 0x40 by default |
