@@ -32,8 +32,10 @@ Four EMG sensors on your forearm pick up electrical signals from muscle contract
 
 ### Demo
 
-[![Live EMG Gesture Classification to Hand Control](https://img.youtube.com/vi/6voH-t2C3i8/hqdefault.jpg)](https://youtu.be/6voH-t2C3i8)
+## Live EMG Gesture Classification to Hand Control + Pick and Place
+https://github.com/user-attachments/assets/ce6b2309-391e-4bea-96a9-4be2bcb43538
 
+## Live Proportional EMG Bicep Control
 https://github.com/user-attachments/assets/e729b2e2-c2a5-4b85-913b-dc0e85c602e7
 
 ### Gestures
