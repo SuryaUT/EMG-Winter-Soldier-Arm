@@ -1,40 +1,69 @@
-# Python
+# ─── Python ──────────────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
 *.egg-info/
+.pytest_cache/
 .venv/
 venv/
+env/
 Bucky_Arm_venv/
 
-# PlatformIO
+# ─── PlatformIO / ESP-IDF ────────────────────────────────────────────────────
+.pio/
 EMG_Arm/.pio/
-EMG_Arm/.vscode/
+# Vendored ESP-IDF components (esp-dsp, esp-nn, esp-tflite-micro).
+# See README "Vendored ESP-IDF components" for the clone commands.
 EMG_Arm/components/
+# sdkconfig is generated from sdkconfig.defaults on first build.
+EMG_Arm/sdkconfig.esp32-*
+!EMG_Arm/sdkconfig.defaults
+*.old
 
-# Animations and media
-animations/
-media/
+# Firmware build artifacts
+*.bin
+*.elf
+*.map
 
-# Master plan
-BUCKY_ARM_MASTER_PLAN.md
+# ─── Editors / IDE ───────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*~
 
-# Data files (large HDF5)
+# ─── Claude Code / Superpowers ───────────────────────────────────────────────
+.claude/
+.claudeignore
+docs/superpowers/
+**/superpowers/
+
+# ─── Logs and captured serial dumps ──────────────────────────────────────────
+*.log
+dump*.txt
+firmware_out*.txt
+parity_*.csv
+tools/*.txt
+
+# ─── Data (large HDF5 recordings — collect your own, see README) ─────────────
 collected_data/
 extra_data/
 assets/
+*.hdf5
+*.h5
 
-# Model binaries
+# ─── Trained model binaries (regenerate via the training pipeline) ───────────
 models/*.joblib
 models/*.npz
+models/*.tflite
 
-# Claude
-.claude/
-.claudeignore
+# ─── Animations / rendered media ─────────────────────────────────────────────
+animations/
+media/
+*.mp4
+*.mov
 
-# OS
+# ─── Planning docs ───────────────────────────────────────────────────────────
+BUCKY_ARM_MASTER_PLAN.md
+
+# ─── OS ──────────────────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
-
-.pio
-.vscode
-*.olddump*.log
