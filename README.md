@@ -1,6 +1,6 @@
 # EMG Winter Soldier Arm
 
-> **Status:** Complete and working end to end — flex your forearm and the hand forms the gesture; flex your bicep and the arm lifts proportionally. All inference runs on the ESP32-S3.
+> **Status:** Complete and working end to end, flex your forearm and the hand forms the gesture; flex your bicep and the arm lifts proportionally. All inference runs on the ESP32-S3.
 
 A 3D-printed robotic hand controlled by EMG (electromyography) signals from your forearm. Flex your muscles, and the hand moves. The system runs real-time gesture classification entirely on-device using an ESP32-S3, with no laptop required during inference.
 
@@ -88,7 +88,7 @@ EMG Sensors (x4)
 ## Hardware Pinout
 
 Servos are **not** driven from ESP32 GPIOs. The ESP32 talks I²C to a PCA9685, which
-generates all seven servo pulses — that keeps servo current off the dev board entirely.
+generates all seven servo pulses, keeping servo current off the dev board entirely.
 
 **ESP32-S3 pins** (`src/config/config.h`, `src/drivers/emg_sensor.c`)
 
@@ -112,7 +112,7 @@ generates all seven servo pulses — that keeps servo current off the dev board 
 
 Servos run at 50 Hz. The PCA9685 is a 12-bit controller, so duty is expressed in ticks of
 20 ms / 4096 ≈ 4.88 µs: `SERVO_DUTY_MIN` 110 (≈540 µs, 0°/extended) to `SERVO_DUTY_MAX` 510
-(≈2490 µs, 180°/flexed). Expect to retune these per servo — see Phase 7.
+(≈2490 µs, 180°/flexed). Expect to retune these per servo (see Phase 7).
 
 > **Power:** the PCA9685's V+ rail comes from the UBEC, never from the ESP32's 5 V pin. Seven
 > MG996R/HS-805BB servos can pull well over 10 A stalled, which will brown out or kill the dev
@@ -129,7 +129,7 @@ used up · `Optional` nice to have.
 |------|-----|------|------|-------|
 | ESP32-S3-DevKitC-1, N16R16 (16 MB flash / 16 MB PSRAM) | 1 | Build | [*(link)*](https://a.co/d/01Zu2owI) | `platformio.ini` configures 32 MB; adjust `board_upload.flash_size` + `partitions.csv` for your variant |
 | MyoWare 2.0 Muscle Sensor | 4 | Build | [*(link)*](https://www.amazon.com/MyoWare-DEV-27924-2-Muscle-Sensor/dp/B0DX624319/ref=sr_1_1?dib=eyJ2IjoiMSJ9.v5-Px_ad26wSnFEfUGOUK5HHLwoZUUjlxa0zemubPmrwtG0NBcjCJZtSv4g54TZiXpmF7KPmmxXB_kJlRST7QGOVnEGflzkCr6MYA5SIZmtaRoeqBOat3yBYwjlSZaxGF_d_IAL2t9k59noDEQREbA.c_ErMeYEB7pXSrFJofNaYj8G8Z07VQRzO2fn5DXQTEU&dib_tag=se&keywords=myoware+muscle+sensor&qid=1785292872&sr=8-1) | 3 forearm + 1 bicep |
-| MyoWare 2.0 Cable Shield | 4 | Build | [*(link)*](https://www.sparkfun.com/myoware-2-0-cable-shield.html) | Breaks the sensor out to a standard cable — one per sensor |
+| MyoWare 2.0 Cable Shield | 4 | Build | [*(link)*](https://www.sparkfun.com/myoware-2-0-cable-shield.html) | Breaks the sensor out to a standard cable, one per sensor |
 | 3-Lead Electrode Sensor Cable (snap connectors) | 4 | Build | [*(link)*](https://www.digikey.com/en/products/detail/sparkfun-electronics/12970/6833933?gclsrc=aw.ds&gad_source=4&gad_campaignid=20232005509&gbraid=0AAAAADrbLliTwurUgMbroaDIsc7uZVEOk&gclid=CjwKCAjwpqHTBhAcEiwAj2AfusFTLBP524ra8qG8XtxSopLvLCPZ8QOEuEz0MOZcQxD1wLX_tgoRfxoCaF0QAvD_BwE) | Lets you place electrodes remotely instead of snapping the board to your skin |
 | Disposable Ag/AgCl Surface EMG Electrodes | ~100 | Consumable | [*(link)*](https://a.co/d/05unx08C) | 3 per sensor per session. Buy far more than you think |
 | PCA9685 16-Channel 12-bit PWM/Servo Driver (I²C) | 1 | Build | [*(link)*](https://a.co/d/03bYEglJ) | Address 0x40 by default |
@@ -144,7 +144,7 @@ used up · `Optional` nice to have.
 
 | Item | Qty | Role | Link | Notes |
 |------|-----|------|------|-------|
-| MG996R Metal-Gear Servo, 180° | 6 | Build | [*(link)*](https://a.co/d/0fHCpXH0) | 5 fingers + wrist. Buy a spare — gears strip |
+| MG996R Metal-Gear Servo, 180° | 6 | Build | [*(link)*](https://a.co/d/0fHCpXH0) | 5 fingers + wrist |
 | Hitec HS-805BB Mega Giant-Scale Servo | 1 | Build | [*(link)*](https://a.co/d/09RSyvfb) | Bicep only. Needs the torque to lift the forearm |
 
 ### Mechanical / printed parts
@@ -152,7 +152,7 @@ used up · `Optional` nice to have.
 | Item | Qty | Role | Link | Notes |
 |------|-----|------|------|-------|
 | 3D Printer | 1 | Tool | access | Or a print service |
-| Braided Fishing Line, ~50 lb | 1 spool | Build | [*(link)*](https://a.co/d/0hsfSs5g) | InMoov tendons. Braided, **not** monofilament — mono stretches |
+| Braided Fishing Line, ~50 lb | 1 spool | Build | [*(link)*](https://a.co/d/0hsfSs5g) | InMoov tendons. Braided, **not** monofilament, mono stretches |
 | Extension Spring Assortment (**loop ends both sides**) | 1 kit | Build | [*(link)*](https://a.co/d/00P6AhfA) | The loops are what hook into the finger returns |
 | Steel Wire, ~1.5 mm | ~1 m | Build | [*(link)*](https://a.co/d/0e5UOqwR) | Finger joint pins |
 | Machine Screw Assortment, M3 | 1 kit | Build | [*(link)* ](https://a.co/d/01VloJq8)| Non-self-tapping. See InMoov per-part sizes |
@@ -174,7 +174,7 @@ used up · `Optional` nice to have.
 | Compression Arm Sleeve | 1 | Optional | [*(link)*](https://a.co/d/052m7mYf) | Holds electrodes down after placement; noticeably reduces motion artifacts |
 
 > **Safety:** you are sticking electrodes to your skin. Run the ESP32 from a battery or a
-> properly isolated USB supply during recording — do not have electrodes on your arm while the
+> properly isolated USB supply during recording. Do not have electrodes on your arm while the
 > board is tied to a mains-powered laptop that is itself plugged in and charging. Treat LiPos
 > with respect: charge in the bag, never leave them unattended, never puncture a swollen pack.
 
@@ -272,17 +272,17 @@ requirements.txt                # Python dependencies
 ### What you need
 
 **Software**
-- [PlatformIO Core](https://docs.platformio.org/en/latest/core/installation/) (or the VS Code extension) — pulls in the ESP-IDF 5.5 toolchain on first build
+- [PlatformIO Core](https://docs.platformio.org/en/latest/core/installation/) (or the VS Code extension) pulls in the ESP-IDF 5.5 toolchain on first build
 - Python 3.11+ and `git`
 
-**Hardware** (only for live EMG — the firmware also runs on recorded data, see below)
+**Hardware** (only for live EMG, the firmware also runs on recorded data, see below)
 - ESP32-S3 DevKitC-1, N16R16 variant (32 MB flash configured in `platformio.ini`)
 - 4x MyoWare (or equivalent) EMG sensors + electrodes
 - PCA9685 servo driver and 5x hobby servos, plus a 3D-printed [InMoov](https://inmoov.fr/build-yours/) hand
 
 ### 1. Clone and fetch the vendored ESP-IDF components
 
-Three ESP-IDF components are used but **not** committed to this repo — clone them into
+Three ESP-IDF components are used but **not** committed to this repo. Clone them into
 `EMG_Arm/components/` before your first build. These are the exact revisions this project
 was built and tested against:
 
@@ -323,8 +323,8 @@ Two independent compile-time switches decide what the firmware does:
 ### Running without sensors
 
 Set `LIVE_EMG 0` in `src/drivers/emg_sensor.h` and leave `MAIN_MODE` at `REAL_MAIN`. A recorded
-EMG session is compiled into the binary (`src/drivers/replay_data.c`), so the entire pipeline —
-filtering, 69 features, all three models, voting — runs and prints predictions with nothing
+EMG session is compiled into the binary (`src/drivers/replay_data.c`), so the entire pipeline 
+(filtering, 69 features, all three models, voting) runs and prints predictions with nothing
 plugged in. This is the fastest way to confirm your toolchain is set up correctly.
 
 ### 4. Training pipeline
@@ -338,8 +338,8 @@ python emg_gui.py
 
 From the GUI: collect training data (guided gesture prompts with live EMG visualization), train
 the models, and export the weights as C headers. `train_ensemble.py` and `train_mlp_tflite.py`
-write `src/core/model_weights.h`, `model_weights_ensemble.h`, and `emg_model_data.cc` directly —
-rebuild the firmware afterward to deploy them.
+write `src/core/model_weights.h`, `model_weights_ensemble.h`, and `emg_model_data.cc` directly.
+Rebuild the firmware afterward to deploy them.
 
 ### What's not in this repo (and how to regenerate it)
 
@@ -366,7 +366,7 @@ piece has been verified alone. Expect **6–10 weeks** at hobby pace, most of it
 
 | Phase | What you're doing | Blocked by |
 |-------|-------------------|------------|
-| 0 | Learn feature extraction on public data | nothing — start today |
+| 0 | Learn feature extraction on public data | nothing, start today |
 | 1 | Order hardware | budget |
 | 2 | Print and assemble the arm | printer time |
 | 3 | Write the sensor driver, collect your own data | sensors arriving |
@@ -390,9 +390,9 @@ Load it, window it, and run it through `EMGFeatureExtractor` in `learning_data_c
 
 > **Important caveat:** Meta's data is wrist-worn, with a different channel count, electrode
 > layout, and sample rate than this build. You **cannot** train a model on it and deploy that
-> model here. Use it to learn the *pipeline* — what a 150-sample window looks like, what a 20–450 Hz
+> model here. Use it to learn the *pipeline* (what a 150-sample window looks like, what a 20–450 Hz
 > bandpass removes, why RMS and waveform length track contraction strength, what mean/median
-> frequency say about fatigue. That understanding is the entire point of this phase.
+> frequency say about fatigue). That understanding is the entire point of this phase.
 
 **You're done when** you can explain, without looking it up, what each of these measures and why
 it helps separate gestures: RMS, MAV, waveform length, zero crossings, slope sign changes, Hjorth
@@ -402,7 +402,7 @@ Those are the 69 features. If they're a black box now, every later debugging ses
 ### Phase 1 — Order hardware (do this first, it ships slowest)
 
 Work through the [Bill of Materials](#bill-of-materials). Order the **sensors, electrodes, servos,
-and the HS-805BB first** — they have the longest lead times, and everything in Phase 3 onward is
+and the HS-805BB first**. They have the longest lead times, and everything in Phase 3 onward is
 blocked on them. Filament and hand tools you can get locally later.
 
 ### Phase 2 — Print and assemble the arm
@@ -416,13 +416,13 @@ Practical notes that will save you a reprint:
 - **PETG for tendon-loaded and spring-loaded parts.** PLA creeps under sustained tension and your
   fingers will slowly go slack over weeks. PLA is fine for cosmetic covers.
 - Print the finger parts at high infill (~40%+); they take the entire tendon load.
-- Ream tendon channels and joint holes with the drill bits before assembly — printed holes come out
+- Ream tendon channels and joint holes with the drill bits before assembly. Printed holes come out
   undersize and you cannot fix it once the finger is together.
 - Use **braided** fishing line. Monofilament stretches and your calibration will drift within a day.
 - **Bench-test every servo before you install it.** Sweep each one through its full range on the
   breadboard first. Finding a dead or stripped MG996R after it's buried in a glued forearm is a
   genuinely miserable afternoon.
-- Don't fully tension the tendons yet — you'll set final tension in Phase 7 once you know each
+- Don't fully tension the tendons yet. You'll set final tension in Phase 7 once you know each
   servo's real endpoints.
 
 **You're done when** you can pull each tendon by hand and watch the corresponding finger curl and
@@ -431,7 +431,7 @@ spring back cleanly.
 ### Phase 3 — Sensor driver + your own data
 
 Now write the acquisition layer. In this repo that's `src/drivers/emg_sensor.c`: continuous ADC DMA
-across 4 channels at 1 kHz, plus the IIR bandpass in `inference.c`. Read it, but write your own — the
+across 4 channels at 1 kHz, plus the IIR bandpass in `inference.c`. Read it, but write your own. The
 sampling loop is where you learn how much of EMG quality is just clean acquisition.
 
 **Sensor placement.** Channels 0–2 go on the forearm (`HAND_CHANNELS = [0, 1, 2]`): flexor carpi
@@ -445,7 +445,7 @@ motion artifacts noticeably.
 
 **Before recording a full session, look at the raw signal.** Stream it and confirm you see a clean
 flat baseline at rest and a sharp burst on contraction. If the baseline is noisy or you see 60 Hz
-hum, fix it now — no amount of modeling recovers bad electrodes.
+hum, fix it now. No amount of modeling recovers bad electrodes.
 
 Record with `python emg_gui.py`, which prompts gestures on a schedule and writes HDF5 via
 `SessionStorage`. Data hygiene that directly determines your ceiling:
@@ -453,11 +453,11 @@ Record with `python emg_gui.py`, which prompts gestures on a schedule and writes
 - **Re-place the electrodes between sessions.** If every session shares one electrode placement,
   your model learns that placement and collapses the moment you re-don it tomorrow. This is the
   single biggest cause of "great accuracy, useless in practice."
-- Keep classes balanced, and record plenty of `rest` — it's the class you're in most of the time.
+- Keep classes balanced, and record plenty of `rest`. It's the class you're in most of the time.
 - Vary arm position and contraction strength. A model trained only on hard contractions won't
   recognize a relaxed one.
 - Transitions between gestures are mislabeled by construction; `align_labels_with_onset()` and
-  `filter_transition_windows()` handle this — understand what they're throwing away.
+  `filter_transition_windows()` handle this. Uderstand what they're throwing away.
 
 ### Phase 4 — Train the models
 
@@ -469,18 +469,18 @@ python train_mlp_tflite.py    # int8 MLP → emg_model_data.cc
 The LDA and its `model_weights.h` export come from `EMGClassifier.export_to_header()`
 (`learning_data_collection.py:2437`), reachable from the GUI's train/export flow.
 
-**Evaluate honestly — this is where people fool themselves.** A random train/test split over
+**Evaluate honestly, this is where people fool themselves.** A random train/test split over
 windows leaks badly: consecutive windows overlap by 125 of 150 samples, so neighbours end up on
 both sides of the split and you'll "measure" 99%. Split **by session**, and ideally by *recording
 day*, so the test set is a placement the model has never seen.
 
 **The baseline to beat.** Per-window cross-validated accuracy on the confusable classes
-(fist / thumbs_up / hook_em) sits around **54–58%** — those three share a lot of flexor activation.
+(fist / thumbs_up / hook_em) sits around **54–58%** because they share a lot of flexor activation.
 After smoothing, full-session replay accuracy is **87.25%** with 115 gesture switches
 (`src/app/main.c:303-319`). Beat it. Obvious levers, roughly in order of payoff:
 1. More and better data for those three gestures specifically.
-2. Features that actually separate them — thumb-specific channel placement helps more than any
-   model change.
+2. Features that actually separate them (thumb-specific channel placement helps more than any
+   model change).
 3. Different classifiers: this repo stops at LDA + ensemble + small MLP. Try an SVM, gradient
    boosting, a 1D CNN over raw windows, or a small temporal model that sees window history.
 4. Per-class confidence thresholds instead of one global threshold.
@@ -501,7 +501,7 @@ inference:
 python live_predict.py --port COM6 --confidence 0.40
 ```
 
-Put the electrodes on, make gestures, watch the predictions. Iterate here — the edit-test cycle is
+Put the electrodes on, make gestures, watch the predictions. Iterate here, the edit-test cycle is
 seconds instead of a two-minute rebuild-and-flash. Only move on when it feels responsive and stable
 on a **freshly placed** set of electrodes.
 
@@ -530,14 +530,14 @@ on a **freshly placed** set of electrodes.
    python tools/parity_capture.py --out dump.log
    python tools/parity_compare.py dump.log --session yourfile.hdf5
    ```
-   Both sides consume bit-identical input, so *every* difference is an implementation bug — no
+   Both sides consume bit-identical input, so *every* difference is an implementation bug, no
    sensor noise, no timing, nothing to hand-wave. This is how the nastiest bug in this project was
    found: a missing 16-byte alignment on the FFT buffer meant esp-dsp's SIMD path returned a
    scrambled spectrum, and 24 of the 69 features were silently garbage **on-device only**. Accuracy
    was mediocre but plausible, so it looked like a modeling problem for weeks. Feature-by-feature
    parity found it in one run. Budget an evening for this phase; it will save you many.
 5. **Go live.** `LIVE_EMG 1`, `MAIN_MODE REAL_MAIN`, electrodes on.
-6. **Calibrate.** Commands are newline-terminated JSON over serial — send `{"cmd": "calibrate"}`.
+6. **Calibrate.** Commands are newline-terminated JSON over serial. Send `{"cmd": "calibrate"}`.
    `calibration.c` records a rest baseline and stores a z-score transform in NVS so it survives
    reboots; this is what absorbs day-to-day differences in electrode placement. The other commands
    are `connect`, `start` (raw streaming), `start_predict` (on-device inference), 
@@ -564,7 +564,7 @@ mechanical problems *here*, while the input is deterministic.
 
 Wire the classifier output into the gesture driver, gated by `ENABLE_HAND` / `ENABLE_BICEP` in
 `config.h`. Then add proportional bicep control (`bicep.c`), which is a different problem from the
-hand — not classification but continuous regression:
+hand, not classification but continuous regression:
 
 - Two-point calibration (`bicep_set_proportional(rest_rms, max_rms)`): record RMS at rest and at
   maximum voluntary contraction, persist both to NVS.
@@ -584,7 +584,7 @@ replay can chatter on the bench. `VOTE_ENTER_THRESHOLD` and `VOTE_HOLD_THRESHOLD
 | Board won't enumerate | Charge-only USB cable; try another |
 | Great CV accuracy, useless live | Session leakage in your split, or a single electrode placement across all sessions |
 | Works in replay, bad live | Electrode placement/skin prep, or calibration never run |
-| Firmware and Python disagree | `PARITY_DUMP` — do not guess |
+| Firmware and Python disagree | `PARITY_DUMP` (do not guess) |
 | Predictions flicker | EMA α and hysteresis thresholds, not the model |
 | Servos buzz or get hot | Commanded past mechanical endpoints; recalibrate duty limits |
 | Board browns out when servos move | Servo power drawn from the ESP32, or grounds not tied together |
